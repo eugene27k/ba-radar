@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+  <channel>
+    <title>Example Newsletter</title>
+    <link>https://news.example.com</link>
+    <description>Weekly notes</description>
+
+    <item>
+      <title>Spec-driven development with agents</title>
+      <link>https://news.example.com/p/spec-driven-agents</link>
+      <guid>https://news.example.com/p/spec-driven-agents</guid>
+      <pubDate>Mon, 03 Aug 2026 11:00:00 GMT</pubDate>
+      <description>Cross-posted commentary on the same topic.</description>
+    </item>
+
+    <item>
+      <title>Evals are the new unit tests</title>
+      <link>https://news.example.com/p/evals</link>
+      <guid>https://news.example.com/p/evals</guid>
+      <pubDate>Sun, 02 Aug 2026 11:00:00 GMT</pubDate>
+      <description>On measuring agent behaviour.</description>
+    </item>
+  </channel>
+</rss>

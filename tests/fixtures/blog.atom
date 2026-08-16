@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="utf-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <title>Example Practitioner</title>
+  <link href="https://example.com/"/>
+  <updated>2026-08-03T10:00:00Z</updated>
+
+  <entry>
+    <title>Spec-driven development with agents</title>
+    <link href="https://example.com/2026/aug/03/spec-driven?utm_source=feed&amp;utm_medium=rss"/>
+    <id>tag:example.com,2026:1</id>
+    <updated>2026-08-03T09:00:00Z</updated>
+    <published>2026-08-03T09:00:00Z</published>
+    <summary type="html">&lt;p&gt;A look at how &lt;b&gt;specifications&lt;/b&gt; change when agents write the code.&lt;/p&gt;</summary>
+  </entry>
+
+  <entry>
+    <title>Example Practitioner: Context engineering notes</title>
+    <link href="https://example.com/2026/aug/02/context-engineering/"/>
+    <id>tag:example.com,2026:2</id>
+    <published>2026-08-02T09:00:00Z</published>
+    <summary>Plain text summary.</summary>
+  </entry>
+
+  <entry>
+    <title>An old post that predates the cursor</title>
+    <link href="https://example.com/2026/jul/01/old"/>
+    <id>tag:example.com,2026:3</id>
+    <published>2026-07-01T09:00:00Z</published>
+    <summary>Should be filtered out by the since cursor.</summary>
+  </entry>
+
+  <entry>
+    <title>Entry with no date at all</title>
+    <link href="https://example.com/2026/aug/03/undated"/>
+    <id>tag:example.com,2026:4</id>
+    <summary>No published or updated element.</summary>
+  </entry>
+</feed>

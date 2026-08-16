@@ -1,0 +1,117 @@
+# Tunable behaviour. No secrets here — those come from the environment only (PRD §8).
+# Stage 5 tuning happens in this file plus config/sources.yaml; neither needs a redeploy.
+
+schedule:
+  timezone: Europe/Kyiv
+  digest_hour: 8
+  weekly_hour: 9
+  catchup_hour: 11
+  # How far past the target hour a delayed GitHub Actions run is still allowed to
+  # deliver. 59 => anything within the 08:xx Kyiv hour proceeds (answers doc Q22).
+  gate_tolerance_minutes: 59
+
+collection:
+  concurrency: 10
+  request_timeout_seconds: 15
+  max_retries: 3              # PRD 1.1.9 — 3 retries after the initial attempt
+  retry_interval_seconds: 5   # PRD 1.1.9
+  per_source_deadline_seconds: 60
+  max_items_per_source: 20    # PRD 1.1.10
+  default_lookback_hours: 48  # PRD 1.1.5 — used when no cursor exists
+  max_lookback_hours: 72      # answers doc Q15 — hard clamp after an outage
+  hn_requery_hours: 72        # answers doc Q11
+  global_item_cap: 300        # answers doc Q20
+  user_agent: "ba-radar/0.1 (+https://github.com/monoquad/ba-radar)"
+  host_min_interval_seconds:
+    hn.algolia.com: 0.5
+
+normalize:
+  excerpt_max_chars: 2000
+  # answers doc Q16 — this list is the spec, not a provisional default.
+  strip_params_exact:
+    - ref
+    - referrer
+    - source
+    - src
+    - fbclid
+    - gclid
+    - msclkid
+    - twclid
+    - igshid
+    - mc_cid
+    - mc_eid
+    - _hsenc
+    - _hsmi
+    - hsctatracking
+    - ck_subscriber_id
+  strip_params_prefix:
+    - utm_
+    - at_
+  # http -> https is forced only for hosts the registry already reaches over https,
+  # plus anything listed here.
+  force_https_hosts: []
+  resolve_redirect_hosts:
+    - t.co
+    - bit.ly
+    - buff.ly
+    - lnkd.in
+    - ow.ly
+    - dlvr.it
+    - feedproxy.google.com
+    - "*.feedburner.com"
+    - link.substack.com
+    - "*.substack.com"
+    - link.mail.beehiiv.com
+    - "*.beehiiv.com"
+  redirect_max_hops: 3
+  redirect_timeout_seconds: 5
+
+dedupe:
+  title_window_days: 14       # answers doc Q12
+
+# Stage 2. Present now so the shape is fixed; unused by Increment 1.
+scoring:
+  threshold: 40               # PRD 2.1.5, applied to the adjusted score (Q7)
+  no_tag_penalty: 20          # PRD 2.1.7
+  multi_source_bonus: 15      # PRD 1.2.5, applied during scoring (Q7)
+  multi_source_min: 3
+  indicator_bonus:            # answers doc Q18
+    leading: 5
+    mixed: 0
+    lagging: -5
+  bands:                      # answers doc Q8 — rule-derived priority
+    critical: 75
+    notable: 55
+    background: 40
+  analysis_cap: 40            # answers doc Q20
+
+digest:
+  caps:                       # PRD 2.3.2–2.3.4
+    critical: 3
+    notable: 5
+    background: 7
+  # Increment 1 only: there is no scoring yet, so the digest is a flat list. Replaced
+  # by `caps` in Stage 2. See DECISIONS.md D-08.
+  stage1_max_items: 30
+  telegram_max_chars: 4096    # PRD 3.1.7
+
+retention:
+  full_rows_days: 90          # answers doc §0 — then prune to id + url
+  runs_days: 90               # PRD 4.2.7
+
+# Task -> model routing. Swapping models is a config edit; swapping providers is one
+# new file under src/ba_radar/llm/. Stage 2.
+llm:
+  provider: anthropic
+  tasks:
+    relevance:
+      model: claude-haiku-4-5
+      max_tokens: 2000
+      batch_size: 20          # PRD 2.1.3 — prompt batching, not the Batches API (Q1)
+    analysis:
+      model: claude-haiku-4-5
+      max_tokens: 1500
+    weekly:
+      model: claude-sonnet-5
+      max_tokens: 4000
+      effort: high

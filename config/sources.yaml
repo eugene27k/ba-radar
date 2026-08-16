@@ -1,0 +1,184 @@
+# BA Radar source registry (PRD §6, req. 4.1).
+#
+# This file is the only thing you need to edit to add, remove or disable a source.
+# Changes take effect on the next collection run with no redeploy (req. 4.1.6).
+#
+# Universal required fields: id, name, method, category, indicator, weight, active
+# Per-method required fields (answers doc Q3):
+#   rss                  -> url
+#   github_releases      -> repo
+#   github_commits_path  -> repo, path
+#   html_diff            -> url, selector
+#   hn_algolia           -> query, min_points
+#
+# category:  vendor | practitioner | newsletter | research | community | ba_source | regional
+# indicator: leading | lagging | mixed
+# weight:    integer 1..10
+#
+# Increment 1 implements rss, github_releases and hn_algolia. Sources needing
+# html_diff or github_commits_path are present but inactive, with a note; they are
+# switched on in Stage 3.
+#
+# Every URL and repo below was verified to resolve on 2026-08-03.
+
+# ---------------------------------------------------------------------------
+# rss
+# ---------------------------------------------------------------------------
+
+- id: simonwillison
+  name: Simon Willison
+  method: rss
+  url: https://simonwillison.net/atom/everything/
+  category: practitioner
+  indicator: leading
+  weight: 10
+  active: true
+
+- id: martinfowler
+  name: martinfowler.com
+  method: rss
+  url: https://martinfowler.com/feed.atom
+  category: practitioner
+  indicator: leading
+  weight: 9
+  active: true
+
+- id: latent-space
+  name: Latent Space
+  method: rss
+  url: https://www.latent.space/feed
+  category: newsletter
+  indicator: mixed
+  weight: 8
+  active: true
+
+- id: interconnects
+  name: Interconnects
+  method: rss
+  url: https://www.interconnects.ai/feed
+  category: newsletter
+  indicator: leading
+  weight: 8
+  active: true
+
+- id: one-useful-thing
+  name: One Useful Thing
+  method: rss
+  url: https://www.oneusefulthing.org/feed
+  category: newsletter
+  indicator: mixed
+  weight: 7
+  active: true
+
+# ---------------------------------------------------------------------------
+# github_releases
+# ---------------------------------------------------------------------------
+
+- id: claude-code-releases
+  name: Claude Code releases
+  method: github_releases
+  repo: anthropics/claude-code
+  category: vendor
+  indicator: leading
+  weight: 10
+  active: true
+
+- id: spec-kit-releases
+  name: GitHub Spec Kit
+  method: github_releases
+  repo: github/spec-kit
+  category: vendor
+  indicator: leading
+  weight: 9
+  active: true
+
+- id: mcp-spec-releases
+  name: Model Context Protocol
+  method: github_releases
+  repo: modelcontextprotocol/modelcontextprotocol
+  category: vendor
+  indicator: leading
+  weight: 9
+  active: true
+
+- id: codex-releases
+  name: OpenAI Codex
+  method: github_releases
+  repo: openai/codex
+  category: vendor
+  indicator: mixed
+  weight: 7
+  active: true
+
+- id: bmad-releases
+  name: BMAD Method
+  method: github_releases
+  repo: bmad-code-org/BMAD-METHOD
+  category: community
+  indicator: leading
+  weight: 7
+  active: true
+
+- id: vscode-releases
+  name: VS Code
+  method: github_releases
+  repo: microsoft/vscode
+  category: vendor
+  indicator: mixed
+  weight: 6
+  active: true
+
+# ---------------------------------------------------------------------------
+# hn_algolia
+# ---------------------------------------------------------------------------
+
+# The PRD's example query, "Claude Code OR spec-driven OR MCP", returns zero results:
+# Algolia's `query` is a full-text search, so "OR" is matched as a literal word. Each
+# term therefore gets its own search and the results are merged. Quoted phrases are
+# used because a bare MCP matches unrelated stories. Measured yield at min_points 50
+# on 2026-08-03: "Claude Code" ~3/week, "MCP" ~3/week, "agentic" ~3/week.
+# "spec-driven" currently returns nothing but is cheap to keep watching.
+- id: hn-agentic
+  name: Hacker News — agentic
+  method: hn_algolia
+  query:
+    - '"Claude Code"'
+    - '"MCP"'
+    - '"agentic"'
+    - '"spec-driven"'
+  min_points: 50
+  category: community
+  indicator: leading
+  weight: 6
+  active: true
+
+# ---------------------------------------------------------------------------
+# Stage 3 — inactive until html_diff / github_commits_path ship
+# ---------------------------------------------------------------------------
+
+# Anthropic Engineering publishes no RSS/Atom feed (verified 2026-08-03: /rss.xml,
+# /news/rss.xml, /feed.xml and /engineering/rss.xml all 404), and the site is not a
+# public repo, so html_diff is the only option. Selector needs confirming against the
+# live page markup when Stage 3 starts.
+- id: anthropic-engineering
+  name: Anthropic Engineering
+  method: html_diff
+  url: https://www.anthropic.com/engineering
+  selector: "main"
+  category: vendor
+  indicator: leading
+  weight: 10
+  active: false
+
+# 12-factor-agents publishes no GitHub releases at all (verified 2026-08-03: the
+# releases endpoint returns an empty array), so github_releases would silently yield
+# nothing. It is a content repo, which is what github_commits_path is for.
+- id: 12-factor-agents
+  name: humanlayer/12-factor-agents
+  method: github_commits_path
+  repo: humanlayer/12-factor-agents
+  path: content
+  category: community
+  indicator: leading
+  weight: 8
+  active: false

@@ -1,0 +1,24 @@
+{
+  "hits": [
+    {
+      "objectID": "44000001",
+      "title": "Show HN: A spec-first workflow for Claude Code",
+      "url": "https://example.dev/spec-first?ref=hn",
+      "points": 184,
+      "num_comments": 61,
+      "created_at_i": 1785600000,
+      "author": "someone"
+    },
+    {
+      "objectID": "44000002",
+      "title": "Ask HN: How are you evaluating MCP servers?",
+      "url": null,
+      "story_text": "We have been struggling to compare implementations.",
+      "points": 92,
+      "num_comments": 40,
+      "created_at_i": 1785513600,
+      "author": "another"
+    }
+  ],
+  "nbHits": 2
+}

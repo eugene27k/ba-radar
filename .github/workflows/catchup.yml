@@ -1,0 +1,68 @@
+name: Digest catch-up
+
+# Scheduled GitHub Actions runs are best-effort: delays of 5-30 minutes are routine
+# and runs are occasionally dropped entirely. The promise is same-day delivery, not
+# minute accuracy (answers doc Q22), and this is what backs that promise.
+#
+# It is safe to run unconditionally because both commands are idempotent:
+# `prepare-digest` is a no-op once today's batch exists, and `send-digest` is a no-op
+# once Telegram has confirmed. It repairs two distinct failures — a digest that was
+# never scheduled at all, and one that was prepared but whose send failed.
+on:
+  schedule:
+    - cron: "0 8 * * 1-5"   # 11:00 Kyiv in summer
+    - cron: "0 9 * * 1-5"   # 11:00 Kyiv in winter
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Bypass the local-time gate"
+        type: boolean
+        default: false
+
+concurrency:
+  group: ba-radar-state
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  catchup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Install
+        run: uv sync --frozen
+
+      - name: Should this run check?
+        id: gate
+        run: uv run ba-radar gate --hour 11 --weekdays-only ${{ inputs.force && '--force' || '' }}
+
+      - name: Collect anything missed
+        if: steps.gate.outputs.proceed == 'true'
+        run: uv run ba-radar collect
+
+      - name: Prepare digest if none exists
+        if: steps.gate.outputs.proceed == 'true'
+        run: uv run ba-radar prepare-digest
+
+      - name: Commit state (pre-send)
+        if: steps.gate.outputs.proceed == 'true'
+        run: ./.github/scripts/commit-state.sh "catch-up prepare"
+
+      - name: Send if not already delivered
+        if: steps.gate.outputs.proceed == 'true'
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: uv run ba-radar send-digest
+
+      - name: Commit state (post-send)
+        if: always() && steps.gate.outputs.proceed == 'true'
+        run: ./.github/scripts/commit-state.sh "catch-up delivered"

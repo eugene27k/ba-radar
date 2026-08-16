@@ -1,0 +1,72 @@
+name: Daily digest
+
+# GitHub Actions cron is UTC-only and Kyiv moves between UTC+2 and UTC+3, so both
+# candidate hours are scheduled and the `gate` step decides which one is actually
+# 08:00 local today. The other exits immediately without delivering.
+on:
+  schedule:
+    - cron: "0 5 * * 1-5"   # 08:00 Kyiv in summer (EEST, UTC+3)
+    - cron: "0 6 * * 1-5"   # 08:00 Kyiv in winter (EET,  UTC+2)
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Bypass the local-time gate"
+        type: boolean
+        default: false
+
+# Every workflow that writes state shares this group so two runs can never race on
+# the SQLite file. Queued rather than cancelled: a skipped digest is a missed digest.
+concurrency:
+  group: ba-radar-state
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  digest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Install
+        run: uv sync --frozen
+
+      - name: Should this run deliver?
+        id: gate
+        run: uv run ba-radar gate --hour 8 --weekdays-only ${{ inputs.force && '--force' || '' }}
+
+      - name: Collect
+        if: steps.gate.outputs.proceed == 'true'
+        run: uv run ba-radar collect
+
+      - name: Prepare digest
+        if: steps.gate.outputs.proceed == 'true'
+        run: uv run ba-radar prepare-digest
+
+      # State is committed BEFORE the send. If the job dies after Telegram accepts the
+      # message but before we could record it, the items are already marked delivered
+      # and tomorrow's digest will not repeat them (answers doc Q14).
+      - name: Commit state (pre-send)
+        if: steps.gate.outputs.proceed == 'true'
+        run: ./.github/scripts/commit-state.sh "prepare digest"
+
+      - name: Send digest
+        if: steps.gate.outputs.proceed == 'true'
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: uv run ba-radar send-digest
+
+      - name: Commit state (post-send)
+        if: always() && steps.gate.outputs.proceed == 'true'
+        run: ./.github/scripts/commit-state.sh "digest delivered"
+
+      - name: Show recent runs
+        if: always() && steps.gate.outputs.proceed == 'true'
+        run: uv run ba-radar status --limit 5

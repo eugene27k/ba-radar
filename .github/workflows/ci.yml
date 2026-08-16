@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# CI does not touch state, so it does not join the ba-radar-state concurrency group.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Install
+        run: uv sync --frozen
+
+      - name: Lint
+        run: uv run ruff check src tests
+
+      - name: Format check
+        run: uv run ruff format --check src tests
+
+      - name: Types
+        run: uv run mypy src
+
+      - name: Tests
+        run: uv run pytest -q
+
+      # A malformed registry is the most likely way to break a scheduled run, and it
+      # is the one file a non-engineer edits. Catch it in the PR, not at 08:00.
+      - name: Validate source registry
+        run: uv run ba-radar validate-sources

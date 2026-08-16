@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+dist/
+build/
+.env
+.DS_Store
+
+# SQLite sidecar files — the .sqlite itself IS committed state, these are not.
+state/*.sqlite-wal
+state/*.sqlite-shm
+state/*.sqlite-journal
