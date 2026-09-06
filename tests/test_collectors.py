@@ -154,6 +154,45 @@ async def test_github_releases_skips_drafts_and_old_releases() -> None:
 
 
 @respx.mock
+async def test_github_release_bare_version_titles_get_the_source_name() -> None:
+    """A digest line saying just "0.153.4" is meaningless once Stage 2 stops grouping
+    by source; titles with actual words are left alone."""
+    respx.get(url__startswith="https://api.github.com/repos/acme/tool/releases").mock(
+        return_value=httpx.Response(
+            200,
+            json=[
+                {
+                    "name": "0.153.4",
+                    "tag_name": "rust-v0.153.4",
+                    "html_url": "https://github.com/acme/tool/releases/tag/rust-v0.153.4",
+                    "published_at": "2026-08-03T09:00:00Z",
+                    "id": 1,
+                },
+                {
+                    "name": "October release: agent mode",
+                    "tag_name": "v9.9.9",
+                    "html_url": "https://github.com/acme/tool/releases/tag/v9.9.9",
+                    "published_at": "2026-08-03T09:30:00Z",
+                    "id": 2,
+                },
+            ],
+        )
+    )
+    source = make_source(
+        "tool", name="OpenAI Codex", method=SourceMethod.GITHUB_RELEASES, url=None, repo="acme/tool"
+    )
+
+    async with HttpFetcher(CFG.collection) as fetcher:
+        result = await GitHubReleasesCollector().fetch(
+            source, SourceState(source_id="tool"), context(fetcher, NOW - timedelta(days=2))
+        )
+
+    titles = {item.title for item in result.items}
+    assert "OpenAI Codex 0.153.4" in titles
+    assert "October release: agent mode" in titles
+
+
+@respx.mock
 async def test_hn_issues_one_request_per_query_and_merges() -> None:
     """Algolia cannot express OR, so each term is its own search (DECISIONS D-09)."""
     route = respx.get(url__startswith="https://hn.algolia.com/api/v1/search_by_date").mock(

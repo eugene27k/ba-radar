@@ -54,7 +54,3 @@ def evaluate_gate(
         )
 
     return GateDecision(True, f"local time {local:%H:%M} is within the window", local)
-
-
-def local_date(now: datetime, timezone: str) -> datetime:
-    return now.astimezone(ZoneInfo(timezone))

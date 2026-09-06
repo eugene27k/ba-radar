@@ -21,10 +21,10 @@ DEFAULT_DB_PATH = REPO_ROOT / "state" / "ba_radar.sqlite"
 
 
 class ScheduleSettings(BaseModel):
+    # Target hours are deliberately NOT settings: they live in the workflow files,
+    # next to the cron lines that must agree with them. A configurable hour here
+    # would silently stop matching the cron and every gate would say "skip".
     timezone: str = "Europe/Kyiv"
-    digest_hour: int = 8
-    weekly_hour: int = 9
-    catchup_hour: int = 11
     gate_tolerance_minutes: int = 59
 
 
@@ -37,6 +37,7 @@ class CollectionSettings(BaseModel):
     max_items_per_source: int = 20
     default_lookback_hours: int = 48
     max_lookback_hours: int = 72
+    cursor_overlap_hours: int = 24
     hn_requery_hours: int = 72
     global_item_cap: int = 300
     user_agent: str = "ba-radar/0.1"
@@ -89,6 +90,7 @@ class DigestSettings(BaseModel):
     caps: DigestCaps = Field(default_factory=DigestCaps)
     stage1_max_items: int = 30
     telegram_max_chars: int = 4096
+    pending_resend_days: int = 3
 
 
 class RetentionSettings(BaseModel):

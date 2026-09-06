@@ -42,8 +42,8 @@ ACTION_UK: dict[Action, str] = {
 }
 
 INDICATOR_UK: dict[Indicator, str] = {
-    Indicator.LEADING: "Лідируючий",
-    Indicator.LAGGING: "Відстаючий",
+    Indicator.LEADING: "Випереджальний",
+    Indicator.LAGGING: "Запізнілий",
     Indicator.MIXED: "Змішаний",
 }
 

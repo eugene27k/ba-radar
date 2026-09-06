@@ -108,3 +108,19 @@ def test_absurdly_long_title_is_clipped_rather_than_breaking_the_split() -> None
     assert len(messages) == 1
     assert len(messages[0]) <= 4096
     assert "…" in messages[0]
+
+
+def test_a_pathological_url_loses_its_link_but_not_its_item() -> None:
+    """One oversized line would make Telegram reject the whole message, failing the
+    send — and with it the day's digest — for a single bad item."""
+    poison = entry("Poison item", url="https://e.com/?q=" + "x" * 8000)
+    healthy = entry("Healthy item")
+    messages = render_digest(
+        [healthy, poison], digest_date=TODAY, processed_count=2, max_chars=4096
+    )
+
+    assert all(len(m) <= 4096 for m in messages)
+    combined = "\n".join(messages)
+    assert "Poison item" in combined  # the item survives, linkless
+    assert "x" * 100 not in combined  # the URL does not
+    assert 'href="https://e.com/p"' in combined  # healthy links are untouched

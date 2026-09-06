@@ -229,3 +229,49 @@ The approved structure includes `src/ba_radar/llm/` and `src/ba_radar/pipeline/`
 are not created in Increment 1 because there is nothing to put in them yet, and empty
 packages are noise. The model-routing config they will read (`llm.tasks` in
 `settings.yaml`) already exists so the shape is fixed.
+
+---
+
+## D-15 — A pending batch is resent for up to 3 days, not only same-day
+
+**Status:** open — extends D-07 / answers doc Q14
+**Source:** answers doc Q14
+
+D-07 made "any unconfirmed run today" the pending batch. That still orphaned the batch
+at midnight: `prepare` only looked at today's runs, so after a day on which both sends
+failed (an expired bot token is the realistic case), the next day selected a fresh
+batch and yesterday's items — already marked delivered — were never sent and never
+reselectable.
+
+Two changes:
+
+- The pending-batch lookup goes back `digest.pending_resend_days` (default 3) local
+  days as well as today. Three days covers a weekend plus a working day to fix the
+  token.
+- "Already delivered today" is keyed on `telegram_confirmed_at`, not `started_at`:
+  Friday's batch delivered by Monday's retry counts as Monday's digest, so Monday's
+  catch-up does not send a second one.
+
+Batches older than the window are left alone deliberately — resending week-old news
+would displace the day's actual signal. Their items stay marked delivered, which keeps
+"never a duplicate" intact; the cost is bounded because every failed send is a non-zero
+exit and therefore a GitHub failure email, every day of the outage.
+
+---
+
+## D-16 — The incremental window starts behind the cursor
+
+**Status:** open — amends the literal reading of PRD req. 1.1.4
+**Source:** PRD req. 1.1.4 («новіші за час останнього успішного збору»)
+
+The cursor is the newest `published_at` seen. Read literally, "only newer items" means
+an entry added to a feed late — backdated, cross-posted, or delivered out of order —
+is skipped on every subsequent run and never collected at all.
+
+`_compute_since` therefore starts the window `collection.cursor_overlap_hours`
+(default 24) behind the cursor. Re-reading the overlap is free: identity dedup makes a
+second sighting of the same canonical URL a no-op. To keep the run counts honest under
+routine re-reads, the dedup result distinguishes `unchanged` (the same source seeing
+the same item again — not counted) from `merged` (a genuinely new source sighting).
+The overlap never triggers the Q15 "window skipped" warning; that fires only when the
+cursor itself is older than `max_lookback_hours`.
