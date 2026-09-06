@@ -24,7 +24,7 @@ collection:
   cursor_overlap_hours: 24
   hn_requery_hours: 72        # answers doc Q11
   global_item_cap: 300        # answers doc Q20
-  user_agent: "ba-radar/0.1 (+https://github.com/monoquad/ba-radar)"
+  user_agent: "ba-radar/0.1 (+https://github.com/eugene27k/ba-radar)"
   host_min_interval_seconds:
     hn.algolia.com: 0.5
 
