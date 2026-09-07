@@ -3,9 +3,8 @@
 
 schedule:
   timezone: Europe/Kyiv
-  digest_hour: 8
-  weekly_hour: 9
-  catchup_hour: 11
+  # Target hours are not configured here. They live in .github/workflows/*.yml, next
+  # to the cron lines that must agree with them — a value here would silently drift.
   # How far past the target hour a delayed GitHub Actions run is still allowed to
   # deliver. 59 => anything within the 08:xx Kyiv hour proceeds (answers doc Q22).
   gate_tolerance_minutes: 59
@@ -19,9 +18,13 @@ collection:
   max_items_per_source: 20    # PRD 1.1.10
   default_lookback_hours: 48  # PRD 1.1.5 — used when no cursor exists
   max_lookback_hours: 72      # answers doc Q15 — hard clamp after an outage
+  # Re-read this far behind the cursor so an entry added to a feed late, with a
+  # published date older than the newest already seen, is still collected. Re-reading
+  # is free: identity dedup makes a second sighting a no-op. See DECISIONS.md D-16.
+  cursor_overlap_hours: 24
   hn_requery_hours: 72        # answers doc Q11
   global_item_cap: 300        # answers doc Q20
-  user_agent: "ba-radar/0.1 (+https://github.com/monoquad/ba-radar)"
+  user_agent: "ba-radar/0.1 (+https://github.com/eugene27k/ba-radar)"
   host_min_interval_seconds:
     hn.algolia.com: 0.5
 
@@ -94,6 +97,9 @@ digest:
   # by `caps` in Stage 2. See DECISIONS.md D-08.
   stage1_max_items: 30
   telegram_max_chars: 4096    # PRD 3.1.7
+  # A batch whose send keeps failing is retried on following days, up to this many
+  # days back, instead of being orphaned. See DECISIONS.md D-15.
+  pending_resend_days: 3
 
 retention:
   full_rows_days: 90          # answers doc §0 — then prune to id + url

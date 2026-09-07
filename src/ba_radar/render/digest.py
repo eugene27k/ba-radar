@@ -63,6 +63,7 @@ def render_digest(
         return [f"{header}\n\n{NO_NEW_ITEMS}"]
 
     continuation = f"<b>BA Radar — {digest_date:%d.%m.%Y} (продовження)</b>"
+    line_budget = max_chars - max(len(header), len(continuation)) - 2
 
     groups: list[tuple[str, list[str]]] = []
     for entry in entries:
@@ -70,6 +71,12 @@ def render_digest(
             f'• <a href="{escape_attr(entry.url)}">{escape_html(_clip(entry.title))}</a>'
             f" <i>{entry.published_at:%d.%m}</i>"
         )
+        # A single oversized line (a pathological URL — titles are already clipped)
+        # would produce a message Telegram rejects outright, failing the whole send
+        # for one bad item. Dropping the link keeps the item and the digest.
+        heading_len = len(f"\n<b>{escape_html(entry.source_label)}</b>") + 1
+        if len(line) > line_budget - heading_len:
+            line = f"• {escape_html(_clip(entry.title))} <i>{entry.published_at:%d.%m}</i>"
         if groups and groups[-1][0] == entry.source_label:
             groups[-1][1].append(line)
         else:

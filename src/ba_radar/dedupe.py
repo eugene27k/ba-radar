@@ -38,6 +38,10 @@ class Candidate:
 class DedupeResult:
     created: list[str] = field(default_factory=list)
     merged: list[str] = field(default_factory=list)
+    # Sightings that added nothing: the same source seeing the same item again. The
+    # cursor overlap re-reads a slice of every feed on every run, so these are
+    # routine and must not inflate the collected/merged counts.
+    unchanged: list[str] = field(default_factory=list)
 
     @property
     def total(self) -> int:
@@ -53,25 +57,36 @@ class Deduplicator:
     def ingest(self, candidates: list[Candidate]) -> DedupeResult:
         result = DedupeResult()
         for candidate in candidates:
-            if self._merge_if_known(candidate):
-                result.merged.append(candidate.item_id)
-            else:
-                self._create(candidate)
-                result.created.append(candidate.item_id)
+            match self._merge_if_known(candidate):
+                case "merged":
+                    result.merged.append(candidate.item_id)
+                case "unchanged":
+                    result.unchanged.append(candidate.item_id)
+                case _:
+                    self._create(candidate)
+                    result.created.append(candidate.item_id)
         return result
 
-    def _merge_if_known(self, candidate: Candidate) -> bool:
+    def _merge_if_known(self, candidate: Candidate) -> str | None:
         existing = self.items.get(candidate.item_id)
 
         if existing is None and candidate.title_key:
             existing = self.items.find_by_title_key(candidate.title_key, self.title_window_start)
 
         if existing is None:
-            return False
+            return None
 
-        self.items.link_source(existing.id, candidate.source.id, self.now)
+        # A pruned row is only an identity tombstone: it suppresses re-delivery, but
+        # re-linking sources to it would recreate item_sources rows that D-05 says
+        # are dropped, for an item that can never be selected again.
+        if existing.pruned:
+            return "unchanged"
+
+        if not self.items.link_source(existing.id, candidate.source.id, self.now):
+            return "unchanged"
+
         self.items.refresh_source_aggregates(existing.id, candidate.source.weight)
-        return True
+        return "merged"
 
     def _create(self, candidate: Candidate) -> None:
         item = Item(

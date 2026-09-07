@@ -159,6 +159,12 @@ Both digest commands are idempotent: `prepare-digest` is a no-op once today's ba
 exists, and `send-digest` is a no-op once Telegram has confirmed. That is what makes it
 safe for the catch-up to run unconditionally.
 
+An unconfirmed batch is not abandoned at midnight either: the next days' runs keep
+resending it for up to `digest.pending_resend_days` (default 3) local days — enough to
+survive a weekend-long outage — and it counts as the digest of the day it finally
+lands. Only past that window is a batch given up on, so a multi-day Telegram failure
+costs the missed days and nothing else. See DECISIONS.md D-15.
+
 ---
 
 ## State

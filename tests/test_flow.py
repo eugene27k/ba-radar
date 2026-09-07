@@ -236,6 +236,53 @@ async def test_a_failed_send_leaves_a_batch_the_catch_up_can_resend(cfg: Setting
 
 
 @respx.mock
+async def test_a_batch_that_failed_yesterday_is_resent_today(cfg: Settings) -> None:
+    """DECISIONS D-15 — a multi-day Telegram outage costs the missed days only.
+
+    Before the resend window existed, the next day selected a fresh batch and
+    yesterday's items — already marked delivered — were orphaned permanently.
+    """
+    mock_feeds()
+    respx.post(url__regex=r".*/sendMessage").mock(return_value=httpx.Response(500))
+
+    await tasks.collect(cfg, now=MONDAY)
+    prepared = tasks.prepare_digest(cfg, now=MONDAY)
+    with pytest.raises(TelegramError):
+        await tasks.send_digest(cfg, SECRETS, now=MONDAY)
+
+    tuesday = MONDAY + timedelta(days=1)
+    retried = tasks.prepare_digest(cfg, now=tuesday)
+    assert retried.state == "already_prepared"
+    assert retried.run_id == prepared.run_id
+
+    respx.post(url__regex=r".*/sendMessage").mock(
+        return_value=httpx.Response(200, json={"ok": True, "result": {"message_id": 7}})
+    )
+    sent = await tasks.send_digest(cfg, SECRETS, now=tuesday)
+    assert sent.state == "sent"
+    assert sent.run_id == prepared.run_id
+
+    # The late delivery counts as Tuesday's digest: the same-day catch-up must not
+    # prepare and send a second one.
+    later = tasks.prepare_digest(cfg, now=tuesday + timedelta(hours=3))
+    assert later.state == "already_delivered"
+
+
+@respx.mock
+async def test_a_batch_older_than_the_resend_window_is_left_alone(cfg: Settings) -> None:
+    """Resending week-old news would displace the day's signal; the cutoff is deliberate."""
+    mock_feeds()
+    await tasks.collect(cfg, now=MONDAY)
+    stale = tasks.prepare_digest(cfg, now=MONDAY)  # its send never happens
+
+    later = MONDAY + timedelta(days=cfg.digest.pending_resend_days + 2)
+    fresh = tasks.prepare_digest(cfg, now=later)
+
+    assert fresh.state == "prepared"
+    assert fresh.run_id != stale.run_id
+
+
+@respx.mock
 async def test_send_without_prepare_is_a_no_op(cfg: Settings) -> None:
     mock_telegram()
     result = await tasks.send_digest(cfg, SECRETS, now=MONDAY)
@@ -279,13 +326,25 @@ def test_first_ever_run_looks_back_48_hours(cfg: Settings) -> None:
     assert warning is None
 
 
-def test_a_fresh_cursor_is_used_as_is(cfg: Settings) -> None:
-    """req. 1.1.4 — collect what is newer than the last successful collection."""
+def test_a_fresh_cursor_is_reread_with_an_overlap(cfg: Settings) -> None:
+    """DECISIONS D-16 — the window starts behind the cursor so an entry added to the
+    feed late, with a published date older than the newest seen, is still collected."""
     cursor = MONDAY - timedelta(hours=6)
     since, warning = tasks._compute_since(
         SourceState(source_id="blog", last_seen_at=cursor), MONDAY, cfg
     )
-    assert since == cursor
+    assert since == cursor - timedelta(hours=cfg.collection.cursor_overlap_hours)
+    assert warning is None
+
+
+def test_the_overlap_alone_does_not_count_as_a_skipped_window(cfg: Settings) -> None:
+    """The Q15 warning is for data that may have been missed; the overlap zone was
+    already collected, so clamping it at the floor is silent."""
+    cursor = MONDAY - timedelta(hours=60)  # fresh, but cursor - overlap < the 72h floor
+    since, warning = tasks._compute_since(
+        SourceState(source_id="blog", last_seen_at=cursor), MONDAY, cfg
+    )
+    assert since == MONDAY - timedelta(hours=cfg.collection.max_lookback_hours)
     assert warning is None
 
 
@@ -329,19 +388,24 @@ async def test_prune_keeps_the_dedup_index_but_drops_the_payload(cfg: Settings) 
     assert links == 0
 
 
-async def test_run_records_are_scoped_to_the_local_day(cfg: Settings) -> None:
+async def test_delivery_confirmations_are_scoped_to_the_local_day(cfg: Settings) -> None:
     """Digest identity is a Kyiv calendar day, so DST cannot produce two per day."""
     conn = connect(cfg.db_path)
     runs = RunRepo(conn)
-    runs.start(RunKind.DIGEST, datetime(2026, 8, 3, 5, 5, tzinfo=UTC))  # 08:05 Kyiv Mon
-    runs.start(RunKind.DIGEST, datetime(2026, 8, 3, 22, 30, tzinfo=UTC))  # 01:30 Kyiv Tue
+
+    early = runs.start(RunKind.DIGEST, datetime(2026, 8, 3, 5, 5, tzinfo=UTC))
+    early.telegram_confirmed_at = datetime(2026, 8, 3, 5, 6, tzinfo=UTC)  # 08:06 Kyiv Mon
+    runs.save(early)
+    late = runs.start(RunKind.DIGEST, datetime(2026, 8, 3, 22, 30, tzinfo=UTC))
+    late.telegram_confirmed_at = datetime(2026, 8, 3, 22, 31, tzinfo=UTC)  # 01:31 Kyiv Tue
+    runs.save(late)
 
     from zoneinfo import ZoneInfo
 
     kyiv = ZoneInfo("Europe/Kyiv")
-    monday = runs.find_on_local_date(RunKind.DIGEST, datetime(2026, 8, 3).date(), kyiv)
-    tuesday = runs.find_on_local_date(RunKind.DIGEST, datetime(2026, 8, 4).date(), kyiv)
+    monday = runs.confirmed_on_local_date(RunKind.DIGEST, datetime(2026, 8, 3).date(), kyiv)
+    tuesday = runs.confirmed_on_local_date(RunKind.DIGEST, datetime(2026, 8, 4).date(), kyiv)
     conn.close()
 
-    assert len(monday) == 1
-    assert len(tuesday) == 1
+    assert monday is not None and monday.id == early.id
+    assert tuesday is not None and tuesday.id == late.id

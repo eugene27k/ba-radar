@@ -13,7 +13,7 @@ import asyncio
 import sqlite3
 import time
 from dataclasses import dataclass, field
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
 
@@ -74,7 +74,13 @@ class SendSummary:
 def _compute_since(
     state: SourceState, now: datetime, settings: Settings
 ) -> tuple[datetime, str | None]:
-    """Incremental window for one source (req. 1.1.4 / 1.1.5, answers doc Q15)."""
+    """Incremental window for one source (req. 1.1.4 / 1.1.5, answers doc Q15).
+
+    The window starts `cursor_overlap_hours` *behind* the cursor: the cursor is the
+    newest published date seen, so an entry added to the feed late with an older
+    published date would otherwise be skipped forever. Re-reading the overlap is free
+    — identity dedup makes a second sighting a no-op. See DECISIONS.md D-16.
+    """
     collection = settings.collection
 
     if state.last_seen_at is None:
@@ -88,7 +94,10 @@ def _compute_since(
             f"cursor was {hours:.0f}h older than the {collection.max_lookback_hours}h "
             f"limit; that window was skipped"
         )
-    return state.last_seen_at, None
+    # No warning when only the overlap dips below the floor — that window was
+    # already collected, nothing is being skipped.
+    since = state.last_seen_at - timedelta(hours=collection.cursor_overlap_hours)
+    return max(since, floor), None
 
 
 async def _fetch_source(
@@ -157,8 +166,9 @@ async def collect(settings: Settings, *, now: datetime | None = None) -> Collect
     github_methods = {SourceMethod.GITHUB_RELEASES, SourceMethod.GITHUB_COMMITS_PATH}
     github_sources = sum(1 for s in active if s.method in github_methods)
     if github_sources and not github_token():
-        # 60 requests an hour unauthenticated. Actions always provides GITHUB_TOKEN, so
-        # this fires locally — where it is otherwise diagnosed as a mystery 403.
+        # 60 requests an hour unauthenticated. The workflows pass GITHUB_TOKEN to the
+        # collect step explicitly (D-17), so this fires locally — where it is
+        # otherwise diagnosed as a mystery 403.
         log.append(
             RunLogEntry(
                 level="warning",
@@ -290,9 +300,20 @@ def _needs_redirect_resolution(url: str, settings: Settings) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def _pending_batch(runs: list[Run]) -> Run | None:
-    """The digest batch selected today but not yet confirmed delivered, if any."""
-    return next((run for run in runs if run.telegram_confirmed_at is None), None)
+def _find_pending_batch(
+    runs_repo: RunRepo, today: date, tz: ZoneInfo, resend_days: int
+) -> Run | None:
+    """The oldest digest batch selected but never confirmed delivered, if any.
+
+    Looks back `resend_days` local days as well as at today: a batch whose send kept
+    failing is retried on following days instead of being orphaned, so a multi-day
+    Telegram outage costs only the missed days (DECISIONS.md D-15). Anything older is
+    left alone — resending week-old news would displace the day's actual signal.
+    """
+    window_start = datetime.combine(
+        today - timedelta(days=resend_days), datetime.min.time(), tzinfo=tz
+    )
+    return next(iter(runs_repo.unconfirmed_since(RunKind.DIGEST, window_start)), None)
 
 
 def _source_index(settings: Settings) -> dict[str, Source]:
@@ -346,18 +367,17 @@ def prepare_digest(settings: Settings, *, now: datetime | None = None) -> Prepar
     runs_repo = RunRepo(conn)
     items_repo = ItemRepo(conn)
 
-    todays_runs = runs_repo.find_on_local_date(RunKind.DIGEST, today, tz)
+    delivered = runs_repo.confirmed_on_local_date(RunKind.DIGEST, today, tz)
+    if delivered is not None:
+        conn.close()
+        return PrepareSummary(run_id=delivered.id, state="already_delivered")
 
-    for run in todays_runs:
-        if run.telegram_confirmed_at is not None:
-            conn.close()
-            return PrepareSummary(run_id=run.id, state="already_delivered")
-
-    # Any unconfirmed run today is a batch that has been selected but not delivered —
-    # whether it crashed before the send (RUNNING) or the send itself failed (FAILED).
-    # Both must be resent as-is: their items are already marked against that run, so
-    # selecting a fresh batch would orphan them permanently.
-    pending = _pending_batch(todays_runs)
+    # Any unconfirmed run in the resend window is a batch that has been selected but
+    # not delivered — whether it crashed before the send (RUNNING) or the send itself
+    # failed (FAILED), today or on a recent day. It must be resent as-is: its items
+    # are already marked against that run, so selecting a fresh batch would orphan
+    # them permanently.
+    pending = _find_pending_batch(runs_repo, today, tz, settings.digest.pending_resend_days)
     if pending is not None:
         conn.close()
         return PrepareSummary(
@@ -414,14 +434,12 @@ async def send_digest(
     runs_repo = RunRepo(conn)
     items_repo = ItemRepo(conn)
 
-    todays_runs = runs_repo.find_on_local_date(RunKind.DIGEST, today, tz)
+    delivered = runs_repo.confirmed_on_local_date(RunKind.DIGEST, today, tz)
+    if delivered is not None:
+        conn.close()
+        return SendSummary(run_id=delivered.id, state="already_delivered")
 
-    for run in todays_runs:
-        if run.telegram_confirmed_at is not None:
-            conn.close()
-            return SendSummary(run_id=run.id, state="already_delivered")
-
-    pending = _pending_batch(todays_runs)
+    pending = _find_pending_batch(runs_repo, today, tz, settings.digest.pending_resend_days)
     if pending is None or pending.id is None:
         conn.close()
         return SendSummary(run_id=None, state="nothing_prepared")
@@ -440,7 +458,7 @@ async def send_digest(
             await telegram.send_messages(messages)
     except Exception as exc:
         pending.status = RunStatus.FAILED  # req. 4.2.5
-        pending.finished_at = datetime.now(UTC)
+        pending.finished_at = now
         pending.log = [
             *pending.log,
             RunLogEntry(level="error", message=f"telegram delivery failed: {exc}"),
@@ -449,8 +467,11 @@ async def send_digest(
         conn.close()
         raise
 
-    pending.telegram_confirmed_at = datetime.now(UTC)
-    pending.finished_at = pending.telegram_confirmed_at
+    # Stamped with this run's `now`, not a fresh clock read: `confirmed_on_local_date`
+    # keys "one digest per day" on this value, so it must fall on the local day the
+    # send ran under.
+    pending.telegram_confirmed_at = now
+    pending.finished_at = now
     pending.status = RunStatus.SUCCESS
     runs_repo.save(pending)
     conn.close()

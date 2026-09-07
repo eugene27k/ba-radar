@@ -31,7 +31,12 @@ def candidate(url: str, title: str, source_id: str = "s1", weight: int = 5) -> C
 
 
 def test_same_url_is_never_a_second_row(conn: sqlite3.Connection) -> None:
-    """req. 1.2.2 — an item already in the store is not added again."""
+    """req. 1.2.2 — an item already in the store is not added again.
+
+    A re-sighting by the same source is `unchanged`, not `merged`: the cursor overlap
+    re-reads a slice of every feed on every run, and those routine sightings must not
+    inflate the counts the run log reports (D-16).
+    """
     repo = ItemRepo(conn)
     deduper = Deduplicator(repo, title_window_days=14, now=NOW)
 
@@ -40,18 +45,22 @@ def test_same_url_is_never_a_second_row(conn: sqlite3.Connection) -> None:
 
     assert len(first.created) == 1
     assert len(second.created) == 0
-    assert len(second.merged) == 1
+    assert len(second.merged) == 0
+    assert len(second.unchanged) == 1
     assert conn.execute("SELECT COUNT(*) FROM items").fetchone()[0] == 1
+    row = conn.execute("SELECT source_count FROM items").fetchone()
+    assert row["source_count"] == 1
 
 
-def test_tracking_variant_of_the_same_url_merges(conn: sqlite3.Connection) -> None:
+def test_tracking_variant_of_the_same_url_is_the_same_item(conn: sqlite3.Connection) -> None:
     repo = ItemRepo(conn)
     deduper = Deduplicator(repo, title_window_days=14, now=NOW)
 
     deduper.ingest([candidate("https://example.com/post", "A post")])
     result = deduper.ingest([candidate("https://www.example.com/post/?utm_source=nl", "A post")])
 
-    assert len(result.merged) == 1
+    assert len(result.created) == 0
+    assert len(result.unchanged) == 1
     assert conn.execute("SELECT COUNT(*) FROM items").fetchone()[0] == 1
 
 
@@ -107,6 +116,23 @@ def test_no_duplicate_status_is_ever_written(conn: sqlite3.Connection) -> None:
 
     statuses = {r["status"] for r in conn.execute("SELECT status FROM items")}
     assert statuses == {"collected"}
+
+
+def test_an_old_url_resighted_after_pruning_stays_suppressed_without_new_links(
+    conn: sqlite3.Connection,
+) -> None:
+    """A pruned row is an identity tombstone (D-05): it blocks re-delivery, but must
+    not grow item_sources rows that describe an item nothing can select again."""
+    repo = ItemRepo(conn)
+    deduper = Deduplicator(repo, title_window_days=14, now=NOW)
+    deduper.ingest([candidate("https://example.com/ancient", "Ancient post")])
+    conn.execute("UPDATE items SET pruned = 1, title = '', title_key = ''")
+    conn.execute("DELETE FROM item_sources")
+
+    result = deduper.ingest([candidate("https://example.com/ancient", "Ancient post", "s2")])
+
+    assert result.unchanged and not result.created and not result.merged
+    assert conn.execute("SELECT COUNT(*) FROM item_sources").fetchone()[0] == 0
 
 
 def test_distinct_titles_and_urls_stay_distinct(conn: sqlite3.Connection) -> None:

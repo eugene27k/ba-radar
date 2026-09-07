@@ -126,6 +126,17 @@ def run(
 ) -> None:
     """Collect, prepare and send in one go. For local use and manual recovery."""
     cfg = _load(settings)
+
+    if not dry_run:
+        # Fail before touching any state: prepare marks items delivered, so finding
+        # out about missing credentials only at the send step would leave a prepared
+        # batch behind (resent automatically for pending_resend_days, orphaned after).
+        try:
+            Secrets.from_env()
+        except RuntimeError as exc:
+            typer.secho(f"{exc} — set them or use --dry-run", fg=typer.colors.RED, err=True)
+            raise typer.Exit(2) from exc
+
     summary = asyncio.run(tasks.collect(cfg))
     typer.echo(
         f"collected: {summary.items_created} new, {summary.items_merged} merged "

@@ -6,6 +6,7 @@ hour, which the registry outgrows at roughly 15 repos.
 
 from __future__ import annotations
 
+import re
 from datetime import UTC, datetime
 
 from ba_radar.collectors.base import FetchContext, FetchResult, register
@@ -13,6 +14,11 @@ from ba_radar.models import RawItem, Source, SourceMethod, SourceState
 from ba_radar.normalize import truncate_excerpt
 
 API_ROOT = "https://api.github.com"
+
+# A release named just "v2.1.261" or "0.154.0-alpha.3" is meaningless once the digest
+# stops grouping by source (Stage 2 groups by priority), so bare versions get the
+# source name prefixed. Titles with actual words are left alone.
+_BARE_VERSION = re.compile(r"^v?\d[\w.+-]*$", re.ASCII)
 
 
 class GitHubReleasesCollector:
@@ -79,7 +85,7 @@ class GitHubReleasesCollector:
             items.append(
                 RawItem(
                     url=link,
-                    title=f"{source.name} {title}" if title.startswith("v") else title,
+                    title=f"{source.name} {title}" if _BARE_VERSION.match(title) else title,
                     published_at=published,
                     excerpt=truncate_excerpt(release.get("body") or "", 2000),
                     external_id=str(release.get("id") or ""),

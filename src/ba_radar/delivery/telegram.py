@@ -97,4 +97,6 @@ class TelegramClient:
             if attempt < MAX_SEND_ATTEMPTS - 1:
                 await asyncio.sleep(2.0 * (attempt + 1))
 
-        raise TelegramError(last_error)
+        # The token is part of the request URL, and error text ends up in the run log
+        # (committed to the repository) and in the Actions log. Never let it through.
+        raise TelegramError(last_error.replace(self._token, "***"))

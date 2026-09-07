@@ -180,9 +180,11 @@ class ItemRepo:
         the prose and the per-source links do not. See DECISIONS.md D-05.
         """
         cutoff_s = _dump_dt(cutoff)
+        # No `pruned = 0` filter here: a link row that somehow reappeared on an
+        # already-pruned item would otherwise never be cleaned up.
         self.conn.execute(
             "DELETE FROM item_sources WHERE item_id IN"
-            " (SELECT id FROM items WHERE collected_at < ? AND pruned = 0)",
+            " (SELECT id FROM items WHERE collected_at < ?)",
             (cutoff_s,),
         )
         cursor = self.conn.execute(
@@ -257,18 +259,34 @@ class RunRepo:
         row = self.conn.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
         return self._row_to_run(row) if row else None
 
-    def find_on_local_date(self, kind: RunKind, local_date: date, tz: ZoneInfo) -> list[Run]:
-        """All runs of `kind` that started on the given local calendar date.
+    def confirmed_on_local_date(self, kind: RunKind, local_date: date, tz: ZoneInfo) -> Run | None:
+        """The run of `kind` whose delivery was confirmed on the given local date, if any.
 
-        Scoping by local date rather than UTC is what makes "one digest per working
-        day" mean the same thing on both sides of a DST change.
+        Keyed on `telegram_confirmed_at`, not `started_at`: a batch prepared on Friday
+        but delivered by Monday's retry counts as Monday's digest. Scoping by local
+        date rather than UTC is what makes "one digest per working day" mean the same
+        thing on both sides of a DST change.
         """
         start_local = datetime.combine(local_date, datetime.min.time(), tzinfo=tz)
         end_local = start_local + timedelta(days=1)
-        rows = self.conn.execute(
-            "SELECT * FROM runs WHERE kind = ? AND started_at >= ? AND started_at < ?"
-            " ORDER BY started_at ASC",
+        row = self.conn.execute(
+            "SELECT * FROM runs WHERE kind = ?"
+            " AND telegram_confirmed_at >= ? AND telegram_confirmed_at < ?"
+            " ORDER BY telegram_confirmed_at DESC LIMIT 1",
             (kind.value, _dump_dt(start_local), _dump_dt(end_local)),
+        ).fetchone()
+        return self._row_to_run(row) if row else None
+
+    def unconfirmed_since(self, kind: RunKind, start: datetime) -> list[Run]:
+        """Runs of `kind` started at or after `start` whose delivery was never confirmed.
+
+        Oldest first, so a backlog of failed batches is resent in the order it was
+        selected.
+        """
+        rows = self.conn.execute(
+            "SELECT * FROM runs WHERE kind = ? AND started_at >= ?"
+            " AND telegram_confirmed_at IS NULL ORDER BY started_at ASC",
+            (kind.value, _dump_dt(start)),
         ).fetchall()
         return [self._row_to_run(row) for row in rows]
 
