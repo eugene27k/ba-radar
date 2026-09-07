@@ -275,3 +275,21 @@ routine re-reads, the dedup result distinguishes `unchanged` (the same source se
 the same item again — not counted) from `merged` (a genuinely new source sighting).
 The overlap never triggers the Q15 "window skipped" warning; that fires only when the
 cursor itself is older than `max_lookback_hours`.
+
+---
+
+## D-17 — `GITHUB_TOKEN` is passed to the collect step explicitly
+
+**Status:** correction of D-14 — no PRD impact
+
+D-14 assumed "Actions always provides that token". It does, but only as
+`secrets.GITHUB_TOKEN` / `github.token` inside workflow expressions — it is **not**
+exported into the environment of `run` steps. As written, every scheduled `collect`
+ran unauthenticated against the GitHub API: 60 requests an hour per IP, shared with
+every other job on the runner's address pool, so the six GitHub-backed sources would
+have failed with 403 from the first scheduled run and left it DEGRADED.
+
+The three state-writing workflows now set `GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}`
+on their collect step. That token is rate-limited at 1,000 requests an hour per
+repository, and reading public releases needs no permission beyond it. D-14's warning
+is unchanged and now fires only locally, as intended.

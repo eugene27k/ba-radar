@@ -166,8 +166,9 @@ async def collect(settings: Settings, *, now: datetime | None = None) -> Collect
     github_methods = {SourceMethod.GITHUB_RELEASES, SourceMethod.GITHUB_COMMITS_PATH}
     github_sources = sum(1 for s in active if s.method in github_methods)
     if github_sources and not github_token():
-        # 60 requests an hour unauthenticated. Actions always provides GITHUB_TOKEN, so
-        # this fires locally — where it is otherwise diagnosed as a mystery 403.
+        # 60 requests an hour unauthenticated. The workflows pass GITHUB_TOKEN to the
+        # collect step explicitly (D-17), so this fires locally — where it is
+        # otherwise diagnosed as a mystery 403.
         log.append(
             RunLogEntry(
                 level="warning",

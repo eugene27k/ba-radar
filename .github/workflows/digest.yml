@@ -43,6 +43,10 @@ jobs:
 
       - name: Collect
         if: steps.gate.outputs.proceed == 'true'
+        env:
+          # Not exported to `run` steps automatically: without this the GitHub sources
+          # go unauthenticated (60 requests/hour per IP) and fail with 403. See D-17.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: uv run ba-radar collect
 
       - name: Prepare digest
