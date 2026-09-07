@@ -204,9 +204,18 @@ class Item(BaseModel):
     delivered_at: datetime | None = None
     pruned: bool = False
 
+    # Stage 2 (migration 002). `relevance_score` above is the model's base score;
+    # `adjusted_score` is the rule-adjusted value persisted at scoring and again at
+    # selection. The provenance trio is for Stage 5 calibration.
+    adjusted_score: int | None = None
+    scored_at: datetime | None = None
+    llm_provider: str | None = None
+    llm_model: str | None = None
+    prompt_version: str | None = None
+
 
 class RunLogEntry(BaseModel):
-    level: str  # "error" | "warning"
+    level: str  # "error" | "warning" | "info"
     source_id: str | None = None
     message: str
 
@@ -231,6 +240,10 @@ class Run(BaseModel):
     @property
     def warnings(self) -> list[RunLogEntry]:
         return [e for e in self.log if e.level == "warning"]
+
+    @property
+    def infos(self) -> list[RunLogEntry]:
+        return [e for e in self.log if e.level == "info"]
 
 
 class SourceState(BaseModel):

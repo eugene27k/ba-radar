@@ -5,6 +5,11 @@ SQLite state to git *between* them, so a crash after the Telegram send can never
 produce a second digest tomorrow — the worst case is a digest that was marked
 delivered but never sent, which is visible and which the catch-up run repairs
 (answers doc Q14).
+
+Stage 2 adds the model phases to `collect` — scoring and analysis run there because
+the excerpts exist only in memory during collection (answers doc §0) — and replaces
+the flat selection with tiered selection under the caps at `prepare` time. When and
+how often digests go out is unchanged.
 """
 
 from __future__ import annotations
@@ -18,9 +23,11 @@ from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
 
 from ba_radar.collectors import FetchContext, FetchResult, HttpFetcher, get_collector
-from ba_radar.dedupe import Candidate, Deduplicator
+from ba_radar.dedupe import Candidate, DedupeResult, Deduplicator
 from ba_radar.delivery import TelegramClient
+from ba_radar.llm import ProviderPool
 from ba_radar.models import (
+    ItemStatus,
     Run,
     RunKind,
     RunLogEntry,
@@ -30,9 +37,18 @@ from ba_radar.models import (
     SourceState,
 )
 from ba_radar.normalize import canonical_url, item_id, title_key
+from ba_radar.pipeline import (
+    DigestSelection,
+    EnrichSummary,
+    Ranked,
+    ScoringItem,
+    display_order,
+    enrich,
+    select_digest,
+)
 from ba_radar.registry import load_registry
 from ba_radar.render import DigestEntry, render_digest
-from ba_radar.settings import Secrets, Settings, github_token
+from ba_radar.settings import LLMSecrets, Secrets, Settings, github_token
 from ba_radar.store import ItemRepo, RunRepo, SourceStateRepo, connect, transaction, vacuum
 from ba_radar.store.repo import to_utc
 
@@ -48,6 +64,7 @@ class CollectSummary:
     items_created: int
     items_merged: int
     log: list[RunLogEntry] = field(default_factory=list)
+    llm: EnrichSummary | None = None
 
 
 @dataclass
@@ -55,7 +72,8 @@ class PrepareSummary:
     run_id: int | None
     state: str  # "prepared" | "already_prepared" | "already_delivered"
     selected: int = 0
-    pool: int = 0
+    pool: int = 0  # undelivered analysed + unscored items considered
+    processed: int = 0  # the header figure: items scored since the previous digest
 
 
 @dataclass
@@ -149,8 +167,62 @@ async def _fetch_source(
     return source, result, log
 
 
-async def collect(settings: Settings, *, now: datetime | None = None) -> CollectSummary:
+def _scoring_set(
+    items_repo: ItemRepo,
+    candidates: list[Candidate],
+    deduped: DedupeResult,
+    index: dict[str, Source],
+) -> list[ScoringItem]:
+    """The rows this run must score, each with the freshest excerpt seen for it.
+
+    New rows always qualify. A row seen again that is still unscored — because a
+    previous run's provider failed or timed out — qualifies too: its excerpt is back
+    in memory, so this is the one moment it can be repaired (DECISIONS.md D-20).
+    Everything else (scored, delivered, pruned) is left alone; nothing is re-scored.
+    """
+    excerpt_for: dict[str, str] = {}
+    for candidate in candidates:
+        row_id = deduped.row_for.get(candidate.item_id)
+        if row_id is None:
+            continue
+        excerpt = candidate.raw.excerpt
+        if len(excerpt) > len(excerpt_for.get(row_id, "")):
+            excerpt_for[row_id] = excerpt
+
+    seen: list[str] = []
+    for row_id in [*deduped.created, *deduped.merged, *deduped.unchanged]:
+        if row_id not in seen:
+            seen.append(row_id)
+
+    result: list[ScoringItem] = []
+    for row_id in seen:
+        item = items_repo.get(row_id)
+        if (
+            item is None
+            or item.pruned
+            or item.delivered_run_id is not None
+            or item.status != ItemStatus.COLLECTED
+            or item.relevance_score is not None
+        ):
+            continue
+        names = tuple(index[sid].name for sid in items_repo.source_ids_for(item.id) if sid in index)
+        result.append(
+            ScoringItem(item=item, excerpt=excerpt_for.get(row_id, ""), source_names=names)
+        )
+    return result
+
+
+async def collect(
+    settings: Settings, *, now: datetime | None = None, llm: ProviderPool | None = None
+) -> CollectSummary:
     now = to_utc(now or datetime.now(UTC))
+
+    # Fail fast on a missing provider key, before the database is even opened: items
+    # collected without a provider could never be scored, because their excerpts are
+    # gone once this run ends (DECISIONS.md D-20).
+    if llm is None:
+        llm = ProviderPool.for_tasks(settings.llm, LLMSecrets.from_env())
+
     conn = connect(settings.db_path)
     items_repo = ItemRepo(conn)
     runs_repo = RunRepo(conn)
@@ -265,10 +337,16 @@ async def collect(settings: Settings, *, now: datetime | None = None) -> Collect
         )
         deduped = deduper.ingest(candidates)
 
+    # Model phases, while the excerpts are still in memory.
+    index = {source.id: source for source in registry.sources}
+    to_score = _scoring_set(items_repo, candidates, deduped, index)
+    enrichment = await enrich(conn, settings, llm, to_score, now=now)
+    log.extend(enrichment.log)
+
     status = RunStatus.SUCCESS
     if active and failed / len(active) >= DEGRADED_FAILURE_RATIO:
         status = RunStatus.DEGRADED  # req. 4.2.4
-    elif any(entry.level == "error" for entry in log):
+    elif enrichment.degraded or any(entry.level == "error" for entry in log):
         status = RunStatus.DEGRADED
 
     run.finished_at = datetime.now(UTC)
@@ -286,6 +364,7 @@ async def collect(settings: Settings, *, now: datetime | None = None) -> Collect
         items_created=len(deduped.created),
         items_merged=len(deduped.merged),
         log=log,
+        llm=enrichment,
     )
 
 
@@ -321,36 +400,51 @@ def _source_index(settings: Settings) -> dict[str, Source]:
 
 
 def _build_entries(
-    conn: sqlite3.Connection, settings: Settings, item_ids_in_order: list[str]
+    conn: sqlite3.Connection, settings: Settings, rows: list[Ranked]
 ) -> list[DigestEntry]:
+    """Digest entries in the given display order, labelled with the strongest source."""
     items_repo = ItemRepo(conn)
     index = _source_index(settings)
 
-    rows: list[tuple[int, str, DigestEntry]] = []
-    for item_id_value in item_ids_in_order:
-        item = items_repo.get(item_id_value)
-        if item is None:
-            continue
+    entries: list[DigestEntry] = []
+    for row in rows:
+        item = row.item
         sources = [index[sid] for sid in items_repo.source_ids_for(item.id) if sid in index]
         best = max(sources, key=lambda s: s.weight) if sources else None
-        label = best.name if best else "—"
-        weight = best.weight if best else 0
-        rows.append(
-            (
-                weight,
-                label,
-                DigestEntry(
-                    title=item.title,
-                    url=item.url,
-                    source_label=label,
-                    published_at=item.published_at,
-                ),
+        entries.append(
+            DigestEntry(
+                title=item.title,
+                url=item.url,
+                source_label=best.name if best else "—",
+                published_at=item.published_at,
+                priority=row.priority,
+                summary=item.summary,
+                ba_insight=item.ba_insight,
+                action=item.action,
+                tags=tuple(item.tags),
+                verbatim_flag=item.verbatim_flag,
             )
         )
+    return entries
 
-    # Group by source: strongest sources first, items newest-first inside each group.
-    rows.sort(key=lambda row: (-row[0], row[1], -row[2].published_at.timestamp()))
-    return [row[2] for row in rows]
+
+def _processed_since(runs_repo: RunRepo) -> datetime | None:
+    """Start of the window the header's «processed» count covers (D-23)."""
+    previous = runs_repo.latest(RunKind.DIGEST)
+    return previous.started_at if previous else None
+
+
+def _select(
+    conn: sqlite3.Connection, settings: Settings, now: datetime
+) -> tuple[DigestSelection, int, int]:
+    """(selection, pool size, processed count) — shared by prepare and preview."""
+    items_repo = ItemRepo(conn)
+    runs_repo = RunRepo(conn)
+    analyzed = items_repo.undelivered(ItemStatus.ANALYZED)
+    unscored = items_repo.undelivered(ItemStatus.COLLECTED)
+    selection = select_digest(analyzed, unscored, settings, now=now)
+    processed = items_repo.count_scored_since(_processed_since(runs_repo))
+    return selection, len(analyzed) + len(unscored), processed
 
 
 def prepare_digest(settings: Settings, *, now: datetime | None = None) -> PrepareSummary:
@@ -384,20 +478,24 @@ def prepare_digest(settings: Settings, *, now: datetime | None = None) -> Prepar
             run_id=pending.id, state="already_prepared", selected=pending.delivered_count
         )
 
-    pool = items_repo.count_undelivered()
-    selected = items_repo.select_for_digest(settings.digest.stage1_max_items)
+    selection, pool, processed = _select(conn, settings, now)
+    rows = selection.ordered
 
     with transaction(conn):
         run = runs_repo.start(RunKind.DIGEST, now)
         assert run.id is not None
-        items_repo.mark_delivered([item.id for item in selected], run.id, now)
-        run.collected_count = pool
-        run.delivered_count = len(selected)
+        items_repo.mark_delivered(
+            [(row.item.id, row.priority, row.adjusted) for row in rows], run.id, now
+        )
+        run.collected_count = processed
+        run.delivered_count = len(rows)
         runs_repo.save(run)
 
     run_id = run.id
     conn.close()
-    return PrepareSummary(run_id=run_id, state="prepared", selected=len(selected), pool=pool)
+    return PrepareSummary(
+        run_id=run_id, state="prepared", selected=len(rows), pool=pool, processed=processed
+    )
 
 
 def preview_digest(settings: Settings, *, now: datetime | None = None) -> list[str]:
@@ -406,17 +504,16 @@ def preview_digest(settings: Settings, *, now: datetime | None = None) -> list[s
     tz = ZoneInfo(settings.schedule.timezone)
 
     conn = connect(settings.db_path)
-    items_repo = ItemRepo(conn)
-    pool = items_repo.count_undelivered()
-    selected = items_repo.select_for_digest(settings.digest.stage1_max_items)
-    entries = _build_entries(conn, settings, [item.id for item in selected])
+    selection, _pool, processed = _select(conn, settings, now)
+    entries = _build_entries(conn, settings, selection.ordered)
     conn.close()
 
     return render_digest(
         entries,
         digest_date=now.astimezone(tz).date(),
-        processed_count=pool,
+        processed_count=processed,
         max_chars=settings.digest.telegram_max_chars,
+        title=settings.digest.header_title,
     )
 
 
@@ -444,13 +541,16 @@ async def send_digest(
         conn.close()
         return SendSummary(run_id=None, state="nothing_prepared")
 
+    # Tier and adjusted score were persisted at prepare time; a resend must not
+    # recompute them, or a merge in between could reshuffle the digest.
     items = items_repo.delivered_for_run(pending.id)
-    entries = _build_entries(conn, settings, [item.id for item in items])
+    entries = _build_entries(conn, settings, display_order(items, settings))
     messages = render_digest(
         entries,
         digest_date=today,
         processed_count=pending.collected_count,
         max_chars=settings.digest.telegram_max_chars,
+        title=settings.digest.header_title,
     )
 
     try:
