@@ -9,6 +9,8 @@ dependencies = [
     "pydantic>=2.9",
     "pyyaml>=6.0",
     "typer>=0.15",
+    "anthropic>=1.4.0",
+    "openai>=3.8.0",
 ]
 
 [project.scripts]
