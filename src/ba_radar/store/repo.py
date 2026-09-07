@@ -79,8 +79,9 @@ class ItemRepo:
             " id, url, title, title_key, category, indicator, published_at, collected_at,"
             " source_count, max_source_weight, relevance_score, tags, priority,"
             " suggested_priority, summary, ba_insight, action, status, verbatim_flag,"
-            " delivered_run_id, delivered_at, pruned"
-            ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            " delivered_run_id, delivered_at, pruned,"
+            " adjusted_score, scored_at, llm_provider, llm_model, prompt_version"
+            ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 item.id,
                 item.url,
@@ -104,6 +105,11 @@ class ItemRepo:
                 item.delivered_run_id,
                 _dump_dt(item.delivered_at),
                 int(item.pruned),
+                item.adjusted_score,
+                _dump_dt(item.scored_at),
+                item.llm_provider,
+                item.llm_model,
+                item.prompt_version,
             ),
         )
         for source_id in item.source_ids:
@@ -128,35 +134,128 @@ class ItemRepo:
             (item_id, weight, item_id),
         )
 
-    def select_for_digest(self, limit: int) -> list[Item]:
-        """Increment 1: undelivered collected items, best sources first.
+    def apply_score(
+        self,
+        item_id: str,
+        *,
+        relevance_score: int,
+        tags: list[PracticeTag],
+        adjusted_score: int,
+        status: ItemStatus,
+        scored_at: datetime,
+        llm_provider: str,
+        llm_model: str,
+        prompt_version: str,
+    ) -> None:
+        """Persist the model's base score and tags plus the adjusted score and the
+        provenance of the verdict. `status` is COLLECTED (awaiting analysis) or
+        FILTERED (below the threshold)."""
+        self.conn.execute(
+            "UPDATE items SET relevance_score = ?, tags = ?, adjusted_score = ?, status = ?,"
+            " scored_at = ?, llm_provider = ?, llm_model = ?, prompt_version = ?"
+            " WHERE id = ?",
+            (
+                relevance_score,
+                json.dumps([t.value for t in tags]),
+                adjusted_score,
+                status.value,
+                _dump_dt(scored_at),
+                llm_provider,
+                llm_model,
+                prompt_version,
+                item_id,
+            ),
+        )
 
-        Stage 2 replaces this with score-ordered selection under the 3/5/7 caps.
+    def apply_analysis(
+        self,
+        item_id: str,
+        *,
+        summary: str,
+        ba_insight: str,
+        action: Action,
+        suggested_priority: Priority,
+        verbatim_flag: bool,
+        priority: Priority,
+        prompt_version: str,
+    ) -> None:
+        """Persist the verdict and move the item to ANALYZED."""
+        self.conn.execute(
+            "UPDATE items SET summary = ?, ba_insight = ?, action = ?, suggested_priority = ?,"
+            " verbatim_flag = ?, priority = ?, prompt_version = ?, status = ?"
+            " WHERE id = ?",
+            (
+                summary,
+                ba_insight,
+                action.value,
+                suggested_priority.value,
+                int(verbatim_flag),
+                priority.value,
+                prompt_version,
+                ItemStatus.ANALYZED.value,
+                item_id,
+            ),
+        )
+
+    def undelivered(self, status: ItemStatus) -> list[Item]:
+        """Undelivered, unpruned items in one status, oldest collected first.
+
+        The digest selection (`ba_radar.pipeline.select`) ranks and caps these; this
+        is the documented replacement point for Increment 1's `select_for_digest`.
         """
         rows = self.conn.execute(
             "SELECT * FROM items"
             " WHERE delivered_run_id IS NULL AND status = ? AND pruned = 0"
-            " ORDER BY max_source_weight DESC, published_at DESC"
-            " LIMIT ?",
-            (ItemStatus.COLLECTED.value, limit),
+            " ORDER BY collected_at ASC, published_at DESC",
+            (status.value,),
         ).fetchall()
         return [self._row_to_item(row) for row in rows]
 
     def count_undelivered(self) -> int:
+        """Items that could still be delivered. FILTERED rows are kept only for dedup
+        and never count (DECISIONS.md D-23)."""
         row = self.conn.execute(
             "SELECT COUNT(*) AS n FROM items WHERE delivered_run_id IS NULL AND pruned = 0"
+            " AND status IN (?, ?)",
+            (ItemStatus.COLLECTED.value, ItemStatus.ANALYZED.value),
         ).fetchone()
         return int(row["n"])
 
-    def mark_delivered(self, item_ids: list[str], run_id: int, at: datetime) -> None:
-        if not item_ids:
-            return
-        placeholders = ",".join("?" for _ in item_ids)
-        self.conn.execute(
-            f"UPDATE items SET status = ?, delivered_run_id = ?, delivered_at = ?"
-            f" WHERE id IN ({placeholders})",
-            [ItemStatus.DELIVERED.value, run_id, _dump_dt(at), *item_ids],
-        )
+    def count_scored_since(self, since: datetime | None) -> int:
+        """The header's «processed» figure: items scored after `since` (all scored
+        items when there is no previous digest). FILTERED items count — they were
+        processed, and rejected."""
+        if since is None:
+            row = self.conn.execute(
+                "SELECT COUNT(*) AS n FROM items WHERE scored_at IS NOT NULL"
+            ).fetchone()
+        else:
+            row = self.conn.execute(
+                "SELECT COUNT(*) AS n FROM items WHERE scored_at > ?", (_dump_dt(since),)
+            ).fetchone()
+        return int(row["n"])
+
+    def mark_delivered(
+        self,
+        rows: list[tuple[str, Priority | None, int | None]],
+        run_id: int,
+        at: datetime,
+    ) -> None:
+        """Mark a selected batch delivered, persisting the tier and adjusted score each
+        item was selected with so a resend renders the same digest."""
+        for item_id, priority, adjusted in rows:
+            self.conn.execute(
+                "UPDATE items SET status = ?, delivered_run_id = ?, delivered_at = ?,"
+                " priority = ?, adjusted_score = ? WHERE id = ?",
+                (
+                    ItemStatus.DELIVERED.value,
+                    run_id,
+                    _dump_dt(at),
+                    priority.value if priority else None,
+                    adjusted,
+                    item_id,
+                ),
+            )
 
     def delivered_for_run(self, run_id: int) -> list[Item]:
         rows = self.conn.execute(
@@ -223,6 +322,11 @@ class ItemRepo:
             delivered_run_id=row["delivered_run_id"],
             delivered_at=_load_dt(row["delivered_at"]),
             pruned=bool(row["pruned"]),
+            adjusted_score=row["adjusted_score"],
+            scored_at=_load_dt(row["scored_at"]),
+            llm_provider=row["llm_provider"],
+            llm_model=row["llm_model"],
+            prompt_version=row["prompt_version"],
         )
 
 
@@ -293,6 +397,13 @@ class RunRepo:
     def prune_before(self, cutoff: datetime) -> int:
         cursor = self.conn.execute("DELETE FROM runs WHERE started_at < ?", (_dump_dt(cutoff),))
         return cursor.rowcount
+
+    def latest(self, kind: RunKind) -> Run | None:
+        """The most recently started run of `kind`, whatever its outcome."""
+        row = self.conn.execute(
+            "SELECT * FROM runs WHERE kind = ? ORDER BY started_at DESC LIMIT 1", (kind.value,)
+        ).fetchone()
+        return self._row_to_run(row) if row else None
 
     def recent(self, limit: int = 20) -> list[Run]:
         rows = self.conn.execute(

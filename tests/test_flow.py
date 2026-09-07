@@ -17,11 +17,14 @@ import respx
 
 from ba_radar import tasks
 from ba_radar.delivery import TelegramError
-from ba_radar.models import RunKind, RunStatus, SourceState
-from ba_radar.settings import Secrets, Settings
-from ba_radar.store import RunRepo, connect
+from ba_radar.labels import PRIORITY_UK, UNSCORED_BLOCK_UK
+from ba_radar.llm import OpenAIProvider, ProviderConfigError, ProviderError, ProviderPool
+from ba_radar.models import ItemStatus, Priority, RunKind, RunStatus, SourceState
+from ba_radar.settings import LLMSecrets, Secrets, Settings
+from ba_radar.store import ItemRepo, RunRepo, connect
 
 from .conftest import fixture_text
+from .fake_llm import FakeProvider, fake_pool
 
 MONDAY = datetime(2026, 8, 3, 5, 5, tzinfo=UTC)  # 08:05 Kyiv
 
@@ -76,13 +79,27 @@ def mock_telegram() -> respx.Route:
 SECRETS = Secrets(telegram_bot_token="test-token", telegram_chat_id="123")
 
 
+async def collect(
+    cfg: Settings, *, now: datetime, fake: FakeProvider | None = None
+) -> tasks.CollectSummary:
+    """`tasks.collect` with the fake provider wired in — tests never reach a vendor."""
+    return await tasks.collect(cfg, now=now, llm=fake_pool(cfg, fake))
+
+
+def item_rows(cfg: Settings) -> dict[str, sqlite3.Row]:
+    conn = connect(cfg.db_path)
+    rows = {row["title"]: row for row in conn.execute("SELECT * FROM items").fetchall()}
+    conn.close()
+    return rows
+
+
 @respx.mock
 async def test_collect_is_idempotent_across_runs(cfg: Settings) -> None:
     """Acceptance 1 — a second run delivers nothing new (§8 idempotency)."""
     mock_feeds()
 
-    first = await tasks.collect(cfg, now=MONDAY)
-    second = await tasks.collect(cfg, now=MONDAY + timedelta(minutes=1))
+    first = await collect(cfg, now=MONDAY)
+    second = await collect(cfg, now=MONDAY + timedelta(minutes=1))
 
     assert first.items_created > 0
     assert second.items_created == 0
@@ -92,7 +109,7 @@ async def test_collect_is_idempotent_across_runs(cfg: Settings) -> None:
 async def test_cross_source_duplicate_is_merged_not_repeated(cfg: Settings) -> None:
     """Both fixtures carry 'Spec-driven development with agents' at different URLs."""
     mock_feeds()
-    await tasks.collect(cfg, now=MONDAY)
+    await collect(cfg, now=MONDAY)
 
     conn = connect(cfg.db_path)
     rows = conn.execute(
@@ -110,7 +127,7 @@ async def test_a_dead_source_does_not_stop_the_others(cfg: Settings) -> None:
     """Acceptance 2 — req. 1.1.8: log the failure, carry on."""
     mock_feeds(blog=500)
 
-    summary = await tasks.collect(cfg, now=MONDAY)
+    summary = await collect(cfg, now=MONDAY)
 
     assert summary.sources_failed == 1
     assert summary.items_created > 0  # the newsletter still landed
@@ -122,7 +139,7 @@ async def test_enough_failures_downgrade_the_run_status(cfg: Settings) -> None:
     """req. 4.2.4 — at or above 30% of sources unavailable the run is degraded."""
     mock_feeds(blog=500, newsletter=500)
 
-    summary = await tasks.collect(cfg, now=MONDAY)
+    summary = await collect(cfg, now=MONDAY)
 
     assert summary.sources_failed == 2
     assert summary.status == RunStatus.DEGRADED
@@ -155,7 +172,7 @@ async def test_registry_errors_are_recorded_on_the_run(cfg: Settings) -> None:
     )
     mock_feeds()
 
-    summary = await tasks.collect(cfg, now=MONDAY)
+    summary = await collect(cfg, now=MONDAY)
     messages = [entry.message for entry in summary.log]
 
     assert any("duplicate id" in m for m in messages)
@@ -169,7 +186,7 @@ async def test_prepare_then_send_marks_the_run_confirmed(cfg: Settings) -> None:
     mock_feeds()
     mock_telegram()
 
-    await tasks.collect(cfg, now=MONDAY)
+    await collect(cfg, now=MONDAY)
     prepared = tasks.prepare_digest(cfg, now=MONDAY)
     assert prepared.state == "prepared"
     assert prepared.selected > 0
@@ -191,7 +208,7 @@ async def test_a_second_send_on_the_same_day_is_a_no_op(cfg: Settings) -> None:
     mock_feeds()
     route = mock_telegram()
 
-    await tasks.collect(cfg, now=MONDAY)
+    await collect(cfg, now=MONDAY)
     tasks.prepare_digest(cfg, now=MONDAY)
     await tasks.send_digest(cfg, SECRETS, now=MONDAY)
     calls_after_first = route.call_count
@@ -210,7 +227,7 @@ async def test_a_failed_send_leaves_a_batch_the_catch_up_can_resend(cfg: Setting
     mock_feeds()
     respx.post(url__regex=r".*/sendMessage").mock(return_value=httpx.Response(500))
 
-    await tasks.collect(cfg, now=MONDAY)
+    await collect(cfg, now=MONDAY)
     prepared = tasks.prepare_digest(cfg, now=MONDAY)
 
     with pytest.raises(TelegramError):
@@ -245,7 +262,7 @@ async def test_a_batch_that_failed_yesterday_is_resent_today(cfg: Settings) -> N
     mock_feeds()
     respx.post(url__regex=r".*/sendMessage").mock(return_value=httpx.Response(500))
 
-    await tasks.collect(cfg, now=MONDAY)
+    await collect(cfg, now=MONDAY)
     prepared = tasks.prepare_digest(cfg, now=MONDAY)
     with pytest.raises(TelegramError):
         await tasks.send_digest(cfg, SECRETS, now=MONDAY)
@@ -272,7 +289,7 @@ async def test_a_batch_that_failed_yesterday_is_resent_today(cfg: Settings) -> N
 async def test_a_batch_older_than_the_resend_window_is_left_alone(cfg: Settings) -> None:
     """Resending week-old news would displace the day's signal; the cutoff is deliberate."""
     mock_feeds()
-    await tasks.collect(cfg, now=MONDAY)
+    await collect(cfg, now=MONDAY)
     stale = tasks.prepare_digest(cfg, now=MONDAY)  # its send never happens
 
     later = MONDAY + timedelta(days=cfg.digest.pending_resend_days + 2)
@@ -308,7 +325,7 @@ async def test_delivered_items_are_excluded_from_the_next_digest(cfg: Settings) 
     mock_feeds()
     mock_telegram()
 
-    await tasks.collect(cfg, now=MONDAY)
+    await collect(cfg, now=MONDAY)
     first = tasks.prepare_digest(cfg, now=MONDAY)
     await tasks.send_digest(cfg, SECRETS, now=MONDAY)
 
@@ -366,7 +383,7 @@ async def test_prune_keeps_the_dedup_index_but_drops_the_payload(cfg: Settings) 
     """Answers doc §0 — full rows for 90 days, then id + url forever."""
     with respx.mock:
         mock_feeds()
-        await tasks.collect(cfg, now=MONDAY - timedelta(days=200))
+        await collect(cfg, now=MONDAY - timedelta(days=200))
 
     conn: sqlite3.Connection = connect(cfg.db_path)
     before = conn.execute("SELECT COUNT(*) FROM items").fetchone()[0]
@@ -409,3 +426,192 @@ async def test_delivery_confirmations_are_scoped_to_the_local_day(cfg: Settings)
 
     assert monday is not None and monday.id == early.id
     assert tuesday is not None and tuesday.id == late.id
+
+
+# ---------------------------------------------------------------------------
+# Stage 2: scoring, analysis, tiers, degraded paths
+# ---------------------------------------------------------------------------
+
+SPEC = "Spec-driven development with agents"
+CONTEXT = "Example Practitioner: Context engineering notes"
+EVALS = "Evals are the new unit tests"
+
+
+@respx.mock
+async def test_collect_scores_analyses_and_the_digest_renders_tiers(cfg: Settings) -> None:
+    """The Stage 2 acceptance path: collect -> score -> analyse -> prepare -> send."""
+    mock_feeds()
+    route = mock_telegram()
+    # blog is weight 9 / leading (+14); newsletter weight 5 / mixed (+5).
+    fake = FakeProvider(scores={SPEC: 70, CONTEXT: 45, EVALS: 20}, default_score=50)
+
+    summary = await collect(cfg, now=MONDAY, fake=fake)
+
+    assert summary.status == RunStatus.SUCCESS
+    assert summary.llm is not None and summary.llm.scored == summary.llm.attempted > 0
+    assert fake.calls["relevance"] == 1  # one batch for a handful of items
+    assert fake.calls["analysis"] == summary.llm.analyzed
+    assert any(entry.level == "info" and "llm anthropic" in entry.message for entry in summary.log)
+
+    rows = item_rows(cfg)
+    assert rows[SPEC]["status"] == "analyzed" and rows[SPEC]["relevance_score"] == 70
+    assert rows[SPEC]["adjusted_score"] == 70 + 9 + 5  # base + weight + leading
+    assert rows[SPEC]["priority"] == "critical"
+    assert rows[SPEC]["summary"] and rows[SPEC]["ba_insight"] and rows[SPEC]["action"] == "read"
+    assert rows[SPEC]["suggested_priority"] == "notable"  # advisory only, tier is rule-derived
+    assert rows[SPEC]["llm_model"] and rows[SPEC]["prompt_version"] == "relevance_v1+analysis_v1"
+    assert rows[EVALS]["status"] == "filtered"  # 20 + 5 = 25 < 40
+    assert rows[EVALS]["summary"] is None  # never analysed
+    assert "excerpt" not in set(rows[SPEC].keys())  # still no source text at rest
+
+    prepared = tasks.prepare_digest(cfg, now=MONDAY)
+    assert prepared.state == "prepared"
+    assert prepared.processed == summary.llm.scored
+    sent = await tasks.send_digest(cfg, SECRETS, now=MONDAY)
+    assert sent.state == "sent"
+
+    body = route.calls.last.request.content.decode()
+    assert f"<b>{PRIORITY_UK[Priority.CRITICAL]}</b>" in body
+    assert "<b>BA:</b>" in body
+    assert "Прочитати" in body  # the fake's action is `read`
+    assert UNSCORED_BLOCK_UK not in body
+    assert "Опрацьовано матеріалів: " + str(summary.llm.scored) in body
+
+
+@respx.mock
+async def test_a_failing_provider_degrades_the_run_but_still_delivers(cfg: Settings) -> None:
+    """Provider failure must not lose a day: items stay unscored and go out in a final
+    «Без аналізу» block, so the outage is visible in the channel."""
+    mock_feeds()
+    route = mock_telegram()
+
+    summary = await collect(cfg, now=MONDAY, fake=FakeProvider(fail=ProviderError("api down")))
+
+    assert summary.status == RunStatus.DEGRADED
+    assert summary.llm is not None and summary.llm.unscored == summary.llm.attempted > 0
+    assert any("api down" in entry.message for entry in summary.log if entry.level == "error")
+    rows = item_rows(cfg)
+    assert all(
+        row["relevance_score"] is None and row["status"] == "collected" for row in rows.values()
+    )
+
+    prepared = tasks.prepare_digest(cfg, now=MONDAY)
+    assert prepared.selected == len(rows)
+    await tasks.send_digest(cfg, SECRETS, now=MONDAY)
+    body = route.calls.last.request.content.decode()
+    assert f"<b>{UNSCORED_BLOCK_UK}</b>" in body
+    assert "<b>BA:</b>" not in body
+
+
+@respx.mock
+async def test_a_hanging_provider_hits_the_phase_deadline(cfg: Settings) -> None:
+    mock_feeds()
+    cfg.llm.phase_deadline_seconds = 0.05
+
+    summary = await collect(cfg, now=MONDAY, fake=FakeProvider(delay=0.5))
+
+    assert summary.status == RunStatus.DEGRADED
+    assert summary.llm is not None and summary.llm.unscored == summary.llm.attempted
+    assert any("deadline" in entry.message for entry in summary.log)
+
+
+@respx.mock
+async def test_unscored_items_are_scored_when_a_feed_shows_them_again(cfg: Settings) -> None:
+    """The self-healing path (DECISIONS D-20): the cursor overlap re-reads every feed,
+    so a row left unscored by an outage gets its excerpt back on the next run."""
+    mock_feeds()
+    await collect(cfg, now=MONDAY, fake=FakeProvider(fail=ProviderError("outage")))
+    assert all(row["relevance_score"] is None for row in item_rows(cfg).values())
+
+    later = await collect(cfg, now=MONDAY + timedelta(hours=3), fake=FakeProvider())
+
+    assert later.status == RunStatus.SUCCESS
+    assert later.items_created == 0
+    assert later.llm is not None and later.llm.scored == later.llm.attempted > 0
+    # Every row the feeds showed again is repaired; a row outside the re-read window
+    # stays unscored until it is seen again or ages out — never silently dropped.
+    scored = [row for row in item_rows(cfg).values() if row["relevance_score"] is not None]
+    assert len(scored) == later.llm.scored
+
+
+@respx.mock
+async def test_scored_items_are_never_rescored(cfg: Settings) -> None:
+    mock_feeds()
+    first = FakeProvider(scores={SPEC: 70})
+    await collect(cfg, now=MONDAY, fake=first)
+
+    second = FakeProvider(scores={SPEC: 10})
+    again = await collect(cfg, now=MONDAY + timedelta(hours=3), fake=second)
+
+    assert second.calls["relevance"] == 0
+    assert again.llm is not None and again.llm.attempted == 0
+    assert item_rows(cfg)[SPEC]["relevance_score"] == 70
+
+
+async def test_a_missing_key_fails_fast_before_any_state_is_touched(cfg: Settings) -> None:
+    with pytest.raises(ProviderConfigError, match="ANTHROPIC_API_KEY"):
+        await tasks.collect(cfg, now=MONDAY)
+    assert not cfg.db_path.exists()
+
+
+def test_the_provider_is_selected_from_config(cfg: Settings) -> None:
+    cfg.llm.provider = "openai"
+    pool = ProviderPool.for_tasks(cfg.llm, LLMSecrets(openai_api_key="sk-test"))
+    provider, route = pool.for_task("relevance")
+    assert isinstance(provider, OpenAIProvider)
+    assert route.model == cfg.llm.tasks["relevance"].model
+
+
+@respx.mock
+async def test_filtered_items_are_never_delivered_and_never_counted_as_pending(
+    cfg: Settings,
+) -> None:
+    mock_feeds()
+    await collect(cfg, now=MONDAY, fake=FakeProvider(default_score=5))  # everything filtered
+
+    conn = connect(cfg.db_path)
+    repo = ItemRepo(conn)
+    assert repo.count_undelivered() == 0
+    assert (
+        repo.undelivered(ItemStatus.ANALYZED) == [] and repo.undelivered(ItemStatus.COLLECTED) == []
+    )
+    conn.close()
+
+    prepared = tasks.prepare_digest(cfg, now=MONDAY)
+    assert prepared.selected == 0
+    assert prepared.processed > 0  # they were processed — and rejected
+
+
+@respx.mock
+async def test_unselected_analysed_items_roll_over_to_the_next_day(cfg: Settings) -> None:
+    mock_feeds()
+    mock_telegram()
+    cfg.digest.caps.critical = cfg.digest.caps.notable = cfg.digest.caps.background = 1
+    await collect(cfg, now=MONDAY, fake=FakeProvider(default_score=50))  # all notable-ish
+
+    monday = tasks.prepare_digest(cfg, now=MONDAY)
+    await tasks.send_digest(cfg, SECRETS, now=MONDAY)
+    tuesday = tasks.prepare_digest(cfg, now=MONDAY + timedelta(days=1))
+
+    assert monday.selected >= 1
+    assert tuesday.state == "prepared" and tuesday.selected >= 1
+    assert tuesday.processed == 0  # nothing new was scored since Monday's digest
+
+
+@respx.mock
+async def test_a_resend_renders_the_tiers_persisted_at_prepare_time(cfg: Settings) -> None:
+    mock_feeds()
+    respx.post(url__regex=r".*/sendMessage").mock(return_value=httpx.Response(500))
+    await collect(cfg, now=MONDAY, fake=FakeProvider(scores={SPEC: 70}, default_score=50))
+    tasks.prepare_digest(cfg, now=MONDAY)
+    with pytest.raises(TelegramError):
+        await tasks.send_digest(cfg, SECRETS, now=MONDAY)
+
+    route = respx.post(url__regex=r".*/sendMessage").mock(
+        return_value=httpx.Response(200, json={"ok": True, "result": {"message_id": 2}})
+    )
+    sent = await tasks.send_digest(cfg, SECRETS, now=MONDAY + timedelta(hours=3))
+    assert sent.state == "sent"
+    body = route.calls.last.request.content.decode()
+    assert f"<b>{PRIORITY_UK[Priority.CRITICAL]}</b>" in body
+    assert body.index(SPEC) < body.index(CONTEXT)

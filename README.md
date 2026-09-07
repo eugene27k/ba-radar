@@ -8,10 +8,13 @@ The point of the product is not aggregation — that is a commodity. It is the v
 attached to each item: *does this change my artifacts, my process, or my tooling?* No
 existing source writes that down, which is what the model is there to do.
 
-**Status: Increment 1 (Stage 1 of PRD §11).** Collection, deduplication and Telegram
-delivery work end to end. There is no relevance scoring or model analysis yet, so the
-digest is a plain grouped list — Stage 2 adds the filter, the per-item verdict and the
-priority tiers. See [DECISIONS.md](DECISIONS.md) for what diverges from the PRD and why.
+**Status: Stage 2 of PRD §11.** Collection, deduplication and Telegram delivery
+(Stage 1) plus relevance scoring, the per-item BA verdict and the Critical / Notable /
+Background tiers under the 3/5/7 caps (Stage 2) work end to end. The model layer is
+provider-agnostic: Anthropic by default, OpenAI as a config-selected alternative. Not
+yet: the `html_diff` and `github_commits_path` collectors (Stage 3), the weekly digest,
+calibration tooling (Stage 5). See [DECISIONS.md](DECISIONS.md) for what diverges from
+the PRD and why.
 
 ---
 
@@ -26,11 +29,18 @@ uv run ba-radar validate-sources
 ```
 
 ```bash
+export ANTHROPIC_API_KEY='sk-ant-...'
+```
+
+```bash
 uv run ba-radar run --dry-run
 ```
 
-`--dry-run` collects from every active source and prints the digest to stdout. It needs
-no Telegram credentials and sends nothing.
+`--dry-run` collects from every active source, scores and analyses what it found, and
+prints the digest to stdout. It needs no Telegram credentials and sends nothing — but
+since Stage 2 it does need the model provider's key and spends a few cents per run,
+because scoring happens during collection (see *How scoring works*). Restore the state
+file afterwards with `git checkout -- state/ba_radar.sqlite`.
 
 ---
 
@@ -65,22 +75,102 @@ export TELEGRAM_BOT_TOKEN='123456789:AAF...' TELEGRAM_CHAT_ID='987654321'
 
 ---
 
+## Setting up the model provider
+
+Scoring and analysis need one model provider. Anthropic is the default; OpenAI is the
+alternative. Which one runs is decided in `config/settings.yaml` (`llm.provider`, with
+optional per-task overrides under `llm.tasks.<task>.provider`), and only the selected
+provider needs a key. Switching is a config edit plus a secret — never a code change.
+
+1. **Get a key.** Anthropic: create one in the [Console](https://platform.claude.com/)
+   and note it as `ANTHROPIC_API_KEY`. OpenAI: create one in the platform dashboard and
+   note it as `OPENAI_API_KEY`.
+
+2. **Add it as a repository secret.** With the [GitHub CLI](https://cli.github.com/)
+   logged in:
+
+   ```bash
+   gh secret set ANTHROPIC_API_KEY
+   ```
+
+   ```bash
+   gh secret set OPENAI_API_KEY
+   ```
+
+   Each command prompts for the value; nothing is echoed or committed. The workflows
+   pass both names to the `collect` step, so an unset one is simply empty.
+
+3. **Verify it.** Locally, export the key and make one tiny call through the configured
+   provider — it prints the provider, the model and the token usage:
+
+   ```bash
+   uv run ba-radar llm-check
+   ```
+
+   `--task analysis` checks the other task's route when the two differ.
+
+**Choosing models.** Both tasks run on `claude-sonnet-5` by default: the verdict is the
+product, and the relevance filter is irreversible (an item scored below the threshold is
+never re-scored, because its excerpt is gone). `claude-haiku-4-5` is the cheaper option
+for `relevance`. For OpenAI, uncomment the example in `settings.yaml`, put in the model
+name from OpenAI's model list, and run `llm-check` — nothing in this repository has been
+verified against the OpenAI API yet.
+
+If the key is missing, `collect` and `run` refuse before touching any state: items
+collected without a provider could never be scored, and the failure would be silent
+until 08:00.
+
+---
+
 ## Commands
 
 | Command | What it does |
 |---|---|
-| `collect` | Fetch every active source, normalise, dedupe, store |
+| `collect` | Fetch every active source, normalise, dedupe, score, analyse, store |
 | `preview` | Render the digest to stdout — touches neither the database nor Telegram |
+| `llm-check` | One tiny call through the configured provider; prints model and token usage |
 | `prepare-digest` | Select today's items and mark them delivered |
 | `send-digest` | Send the prepared digest to Telegram |
 | `run` | `collect` + `prepare` + `send`; `--dry-run` prints instead of sending |
-| `status` | Recent runs, with error counts and delivery confirmation |
+| `status` | Recent runs, with error counts, delivery confirmation and the model usage line |
 | `validate-sources` | Check `config/sources.yaml`; non-zero exit on any bad record |
 | `prune` | Apply the retention policy and vacuum the database |
 | `gate --hour N` | Decide whether a UTC-scheduled run is the right one for local hour N |
 
 `prepare-digest` and `send-digest` are separate because the workflow commits state to
 git **between** them — see *Crash safety* below.
+
+---
+
+## How scoring works
+
+Everything model-related happens inside `collect`, because excerpts exist only in
+memory during a run and are never written to the database.
+
+1. **Relevance.** New items are scored in prompt batches (`llm.tasks.relevance.
+   batch_size`): the model returns a 0–100 score for the content alone plus practice
+   tags. The rubric is `src/ba_radar/llm/prompts/relevance_v1.md`.
+2. **Adjustment.** Rules add the strongest source's weight, the indicator bonus and the
+   multi-source bonus, and subtract the no-tag penalty (`scoring` in `settings.yaml`).
+   Below `scoring.threshold` the item is `FILTERED`: kept for deduplication, never
+   delivered.
+3. **Analysis.** Items above the threshold, best first and at most `analysis_cap` per
+   run, get the verdict: a two-sentence Ukrainian summary, the «BA:» insight, an action
+   (`try` / `read` / `note`) and the model's advisory priority. A summary that copies
+   twelve or more consecutive words from the source is flagged and rendered without
+   the summary.
+4. **Tiers.** At `prepare-digest` time the adjusted score is recomputed from the
+   current source aggregates — a late cross-source merge still raises the bonus — and
+   `scoring.bands` decides Critical / Notable / Background. Each tier is cut at
+   `digest.caps`; unselected items roll over for up to `digest.rollover_hours`.
+
+**If the provider fails** (down, rate-limited, or past `llm.phase_deadline_seconds`),
+the run is DEGRADED, the affected items stay unscored, and the digest delivers them in
+a final «Без аналізу» block capped by `digest.unscored_max_items`: the outage is
+visible in the channel and nothing is dropped. An unscored item that a feed shows again
+on a later run is scored then. Every run logs an `info` line with the provider, model,
+prompt version, counts, tokens and an estimated cost from `llm.pricing`; `status`
+shows it.
 
 ---
 
@@ -175,7 +265,9 @@ means re-delivering everything.
 
 **Excerpts are never persisted.** They exist in memory for the duration of a run and are
 discarded. This keeps the committed file small enough to live in git, and means no
-copyrighted source text is retained at rest.
+copyrighted source text is retained at rest. Model *outputs* are persisted — score,
+tags, summary, insight, action, tier — together with the provider, model and prompt
+version that produced them, for calibration in Stage 5.
 
 Retention: full rows for 90 days, then pruned to id + URL, which are kept forever so
 deduplication never regresses. `prune` runs weekly from `collect.yml`.
@@ -205,7 +297,9 @@ uv run ruff check src tests && uv run ruff format --check src tests && uv run my
 ```
 
 Tests never touch the network: HTTP is mocked with `respx` against recorded payloads in
-`tests/fixtures/`.
+`tests/fixtures/`, and model calls go through a fake provider (`tests/fake_llm.py`)
+that implements the same protocol as the real adapters. The adapters themselves are
+tested against response fixtures validated by the SDKs' own response models.
 
 ---
 
@@ -216,6 +310,9 @@ config/sources.yaml      the source registry — the only file you need to edit
 config/settings.yaml     thresholds, caps, model routing; no secrets
 src/ba_radar/
   collectors/            one module per collection method + shared async HTTP
+  llm/                   provider-agnostic model calls: Anthropic and OpenAI adapters,
+                         provider selection, versioned prompts (prompts/*.md)
+  pipeline/              scoring, adjusted score, analysis, selection under the caps
   store/                 SQLite schema, migrations, repositories
   render/                digest formatting and 4096-char splitting
   delivery/              Telegram
@@ -224,6 +321,3 @@ src/ba_radar/
   tasks.py               collect / prepare / send / prune orchestration
 state/ba_radar.sqlite    committed state
 ```
-
-Stage 2 adds `src/ba_radar/llm/` (provider-agnostic model calls, versioned prompts) and
-`src/ba_radar/pipeline/` (scoring, analysis, prioritisation).

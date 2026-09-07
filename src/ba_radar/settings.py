@@ -88,7 +88,15 @@ class DigestCaps(BaseModel):
 
 class DigestSettings(BaseModel):
     caps: DigestCaps = Field(default_factory=DigestCaps)
-    stage1_max_items: int = 30
+    # Bold first line of every digest message. The channel is @AIforBARadar, so the
+    # header matches it by default (DECISIONS.md D-24).
+    header_title: str = "AIforBA Radar"
+    # Cap on the final «Без аналізу» block: items a failed or timed-out provider left
+    # unscored. Replaces Increment 1's `stage1_max_items` (DECISIONS.md D-21).
+    unscored_max_items: int = 30
+    # Analysed but unselected items roll over to later digests for this long, measured
+    # from `collected_at` (DECISIONS.md D-21).
+    rollover_hours: int = 72
     telegram_max_chars: int = 4096
     pending_resend_days: int = 3
 
@@ -101,13 +109,28 @@ class RetentionSettings(BaseModel):
 class LLMTask(BaseModel):
     model: str
     max_tokens: int
+    provider: str | None = None  # overrides `llm.provider` for this task
     batch_size: int | None = None
     effort: str | None = None
 
 
+class ModelPrice(BaseModel):
+    """USD per million tokens, for the cost estimate in the run log."""
+
+    input_per_mtok: float
+    output_per_mtok: float
+
+
 class LLMSettings(BaseModel):
     provider: str = "anthropic"
+    # Wall-clock budget for each model phase (scoring, analysis). Past it, remaining
+    # items stay unscored and the run is DEGRADED, so a hanging provider cannot blow
+    # the 10-minute cycle.
+    phase_deadline_seconds: float = 240.0
+    request_timeout_seconds: float = 120.0
+    concurrency: int = 4
     tasks: dict[str, LLMTask] = Field(default_factory=dict)
+    pricing: dict[str, ModelPrice] = Field(default_factory=dict)
 
 
 class Settings(BaseModel):
@@ -135,13 +158,31 @@ class Settings(BaseModel):
         return cls.model_validate(raw)
 
 
-class Secrets(BaseModel):
+class LLMSecrets(BaseModel):
+    """Model provider keys. Both optional: only the configured provider's key is
+    required, and that check happens in `ba_radar.llm` before any state is touched.
+
+    `collect` needs these and nothing else, which is why they are separable from the
+    Telegram credentials that `send-digest` requires.
+    """
+
+    anthropic_api_key: str | None = None
+    openai_api_key: str | None = None
+
+    @classmethod
+    def from_env(cls) -> LLMSecrets:
+        return cls(
+            anthropic_api_key=os.environ.get("ANTHROPIC_API_KEY") or None,
+            openai_api_key=os.environ.get("OPENAI_API_KEY") or None,
+        )
+
+
+class Secrets(LLMSecrets):
     """Read from the environment at the point of use, never stored or logged."""
 
     telegram_bot_token: str
     telegram_chat_id: str
     github_token: str | None = None
-    anthropic_api_key: str | None = None
 
     @classmethod
     def from_env(cls) -> Secrets:
@@ -150,11 +191,13 @@ class Secrets(BaseModel):
         ]
         if missing:
             raise RuntimeError(f"missing required environment variable(s): {', '.join(missing)}")
+        llm = LLMSecrets.from_env()
         return cls(
             telegram_bot_token=os.environ["TELEGRAM_BOT_TOKEN"],
             telegram_chat_id=os.environ["TELEGRAM_CHAT_ID"],
             github_token=os.environ.get("GITHUB_TOKEN") or None,
-            anthropic_api_key=os.environ.get("ANTHROPIC_API_KEY") or None,
+            anthropic_api_key=llm.anthropic_api_key,
+            openai_api_key=llm.openai_api_key,
         )
 
 

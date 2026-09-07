@@ -47,6 +47,10 @@ jobs:
           # Not exported to `run` steps automatically: without this the GitHub sources
           # go unauthenticated (60 requests/hour per IP) and fail with 403. See D-17.
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Scoring and analysis run inside `collect` (Stage 2). Only the provider
+          # selected in config/settings.yaml needs its key; the other may stay unset.
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         run: uv run ba-radar collect
 
       - name: Prepare digest

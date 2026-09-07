@@ -13,6 +13,14 @@ from ba_radar.store import connect
 FIXTURES = Path(__file__).parent / "fixtures"
 
 
+@pytest.fixture(autouse=True)
+def _no_provider_keys(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Tests never reach a real provider: whatever the developer has exported must not
+    leak into a test, and the fail-fast tests rely on the keys being absent."""
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+
 @pytest.fixture
 def settings(tmp_path: Path) -> Settings:
     cfg = Settings.load()

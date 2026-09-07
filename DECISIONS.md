@@ -293,3 +293,234 @@ The three state-writing workflows now set `GITHUB_TOKEN: ${{ secrets.GITHUB_TOKE
 on their collect step. That token is rate-limited at 1,000 requests an hour per
 repository, and reading public releases needs no permission beyond it. D-14's warning
 is unchanged and now fires only locally, as intended.
+
+---
+
+## D-18 — Stage 2 was built from the brief; the PRD and answers doc were unavailable
+
+**Status:** open — every entry below that cites "assumption" needs checking against
+the PRD when it is back in reach
+**Source:** `docs/STAGE2-BRIEF.md` §0
+
+Neither the PRD nor `ba-radar-answers.md` was available in the session that built
+Stage 2 (asked for, not found). The brief plus the requirement numbers already quoted
+in this log are the spec. Where the brief said "check the PRD's wording", the
+assumption is recorded as its own entry (D-22, D-23, D-24, D-30, D-31). The user
+accepted the proposed defaults for the §5 questions wholesale ("apply all").
+
+---
+
+## D-19 — Base score persisted at collect time, adjustment recomputed at prepare time
+
+**Status:** open — needs folding into the answers doc Q7
+**Source:** answers doc Q7; PRD 2.1.5–2.1.7, 1.2.5
+
+`relevance_score` holds the model's *base* score for the content alone. The adjusted
+score (base + max source weight + indicator bonus + multi-source bonus − no-tag
+penalty) is computed twice:
+
+- at collect time, to decide FILTERED vs. analysis, because analysis needs the
+  excerpt and the excerpt exists only during that run;
+- again at `prepare-digest` time, from the *current* `source_count` and
+  `max_source_weight`, to rank and tier — so a cross-source merge that arrives after
+  scoring still earns the multi-source bonus. Nothing is ever re-scored.
+
+The value used for a digest is persisted on the item (`adjusted_score`, `priority`) at
+selection time, so a resend renders the same tiers (D-15 path) and Stage 5 can see
+what the reader actually got.
+
+---
+
+## D-20 — Missing key fails fast; runtime failure degrades and self-heals
+
+**Status:** open — reconciles two clauses of the brief
+**Source:** brief §2.6, §3.A, §3.B "provider failure must not lose a day"
+
+Two different failures, two behaviours:
+
+- **No key for the configured provider** is a configuration error. `collect` (and
+  `run`, including `--dry-run`) refuses before the database is opened. Collecting
+  anyway would leave every item permanently unscored, because the excerpts are gone
+  when the run ends; refusing keeps the cursors where they are, and the next run
+  with a key collects everything up to `max_lookback_hours`. The failure is a
+  non-zero exit, i.e. a GitHub failure email.
+- **Provider down, rate-limited, refusing, or past the phase deadline** at runtime is
+  a DEGRADED run. Affected items stay `COLLECTED` with a NULL score and are delivered
+  in a final «Без аналізу» block (D-21) so the outage is visible in the channel.
+
+Self-healing: the cursor overlap (D-16) re-reads a slice of every feed on every run,
+so an unscored row that a feed shows again gets its excerpt back in memory and is
+scored then. `DedupeResult.row_for` maps each sighting to its row for this purpose.
+Rows outside the re-read window stay unscored until pruned — never silently dropped
+from a digest, because the fallback block delivers them first.
+
+---
+
+## D-21 — Rollover age, the unscored block, and what happened to `stage1_max_items`
+
+**Status:** open — assumption
+**Source:** brief §3.B, §3.C
+
+- Analysed but unselected items roll over to later digests for
+  `digest.rollover_hours` (72, consistent with `max_lookback_hours`), measured from
+  `collected_at` — the moment the item entered the pool.
+- `digest.stage1_max_items` is renamed `digest.unscored_max_items` and caps the
+  «Без аналізу» block. Unscored items are ordered scored-but-unanalysed first (by
+  adjusted score), then by source weight and date, under the same rollover age.
+- An item scored above the threshold but left without a verdict (analysis cap or
+  deadline) stays `COLLECTED` with its score and goes to the unscored block too: no
+  verdict, no tier. ANALYZED means "scored *and* analysed".
+
+---
+
+## D-22 — `verbatim_flag`: twelve consecutive words
+
+**Status:** open — assumption, check PRD §8 wording
+**Source:** PRD §8 (copyright); brief §3.B
+
+The PRD's wording could not be checked. Implemented: the flag is set when the summary
+shares a run of twelve or more consecutive words with the excerpt, compared after
+case-folding and stripping punctuation. A flagged item renders with its title, source,
+insight, action and tags — never the summary. The insight is always our own text.
+
+---
+
+## D-23 — "Processed" means items scored since the previous digest run started
+
+**Status:** open — assumption, check PRD 3.1.3
+**Source:** PRD 3.1.3; brief §3.C
+
+The header's «Опрацьовано матеріалів» counts items whose `scored_at` is after the
+start of the most recent digest run of any outcome (all scored items when there is
+none). FILTERED items count — they were processed and rejected, which is the point of
+the number. `count_undelivered` no longer counts FILTERED rows.
+
+---
+
+## D-24 — The header reads «AIforBA Radar», from config
+
+**Status:** open — assumption
+**Source:** brief §3.C
+
+The channel is @AIforBARadar, so the header matches it. It is `digest.header_title` in
+`settings.yaml` rather than a constant, so reverting to «BA Radar» is a one-line edit.
+
+---
+
+## D-25 — Priority is rule-derived from bands; the model's suggestion is advisory
+
+**Status:** open — clarifies answers doc Q8
+**Source:** answers doc Q8; `scoring.bands`
+
+`priority` = critical ≥ 75, notable ≥ 55, else background, on the adjusted score,
+for every item that passed the threshold. `suggested_priority` is stored untouched
+for calibration and never influences the tier. If the threshold and the background
+band ever disagree, a relevant item still lands in Background rather than in no
+block at all.
+
+---
+
+## D-26 — Scored-but-unanalysed items are not ANALYZED
+
+**Status:** open — see D-21
+**Source:** brief §3.B statuses
+
+Recorded separately because it is easy to get wrong: `ANALYZED` requires a verdict.
+An item with a score and no verdict is a `COLLECTED` item with a score, and it is
+delivered through the unscored block, not through a tier.
+
+---
+
+## D-27 — Analysis is one request per item with bounded concurrency; one deadline per phase
+
+**Status:** open — implementation choice
+**Source:** brief §3.A phase deadline; §3.B analysis
+
+Scoring is batched (answers doc Q1). Analysis is not: a Ukrainian summary plus
+insight per item makes a batch slow, and one malformed reply should cost one item, not
+twenty. Requests run `llm.concurrency` at a time. `llm.phase_deadline_seconds` applies
+to each phase separately (scoring, then analysis), and a request that would start
+after the deadline is skipped rather than started.
+
+---
+
+## D-28 — What the Anthropic adapter does and does not send
+
+**Status:** open — checked against the `/claude-api` skill on 2026-09-07
+**Source:** brief §3.A
+
+- No `temperature` / `top_p` / `top_k` (rejected by the 4.7+ family), no assistant
+  prefill (rejected), no `budget_tokens` (rejected on Sonnet 5 / Opus 5).
+- No `thinking` parameter at all: Sonnet 5 and Opus 5 run adaptive thinking by
+  default, Haiku 4.5 runs without; omitting it is the one shape every current model
+  accepts. Thinking tokens count against `max_tokens`, so the task budgets are
+  generous (16000 for scoring, 8000 for analysis) — only generated tokens are billed.
+- `effort` is forwarded inside `output_config` only when a task configures it; Haiku
+  4.5 rejects it.
+- Structured output via `output_config.format` (`json_schema`); the JSON schema is
+  derived from the pydantic reply model and stripped of keywords neither provider's
+  strict mode accepts (`minimum`, `maximum`, `minLength`, `pattern`, …); the
+  pydantic model still enforces those on the parsed reply.
+- SDK retries left at the default (2); explicit `llm.request_timeout_seconds`.
+- Prompt caching is not used (D-11).
+
+---
+
+## D-29 — Adapter fixtures are synthesised, not recorded from live calls
+
+**Status:** open — replace with real recordings after the first `llm-check`
+**Source:** brief §3.E "recorded raw responses as fixtures"
+
+No provider key was available in the build session. `tests/fixtures/anthropic_message.
+json` and `openai_response.json` were constructed from the SDKs' own response models
+(`anthropic.types.Message`, `openai.types.responses.Response`) and validated by them,
+carrying the same relevance payload so the adapter test can assert both parse to the
+same object. The OpenAI request shape was written from the published documentation
+and **has not been exercised against the live API**; `llm-check` is the verification.
+
+---
+
+## D-30 — The weekly digest is not in Stage 2
+
+**Status:** open — check PRD §11
+**Source:** brief §3.F
+
+Included only if PRD §11 put it in Stage 2, which could not be checked; the config
+block `llm.tasks.weekly` stays so the routing shape is fixed.
+
+---
+
+## D-31 — Rubric calibration examples are the maintainer's, from the first digest
+
+**Status:** open — replace in Stage 5
+**Source:** brief §5.2
+
+The channel had delivered exactly one digest (nine items) when the rubric was written
+and the user did not classify them. `relevance_v1.md` therefore carries the
+implementer's classification of those nine, marked provisional, as calibration
+examples. Stage 5 replaces them with reader-confirmed examples; that is what the
+prompt version pin is for.
+
+---
+
+## D-32 — Verdict provenance is persisted per item
+
+**Status:** addition — no PRD conflict
+**Source:** brief §3.F
+
+Migration 002 adds `scored_at`, `adjusted_score`, `llm_provider`, `llm_model` and
+`prompt_version` to `items`. `llm_provider` / `llm_model` record the *relevance*
+route (the score is what Stage 5 calibrates); `prompt_version` records the relevance
+prompt at scoring time and `relevance_vN+analysis_vM` once analysed. Pruning keeps
+all five — they cost a few bytes and outlive the prose on purpose (D-05).
+
+---
+
+## D-33 — Cost estimates come from a pricing table in settings
+
+**Status:** addition — no PRD conflict
+**Source:** brief §3.A run log
+
+`llm.pricing` maps a model id to USD per million input/output tokens; the run's
+`info` log line multiplies it by the measured usage. Prices change and models get
+added, so this is config, not code. A model without a row reports `n/a`.

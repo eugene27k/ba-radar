@@ -1,0 +1,42 @@
+{
+  "id": "resp_fixture_relevance_batch",
+  "created_at": 1789000000.0,
+  "model": "gpt-5.6-terra",
+  "object": "response",
+  "output": [
+    {
+      "id": "rs_fixture",
+      "summary": [],
+      "type": "reasoning"
+    },
+    {
+      "id": "msg_fixture",
+      "content": [
+        {
+          "annotations": [],
+          "text": "{\"verdicts\": [{\"key\": \"1\", \"relevance\": 72, \"tags\": [\"specifications\", \"evals\"], \"rationale\": \"Concrete spec-writing practice with measured results.\"}, {\"key\": \"2\", \"relevance\": 12, \"tags\": [], \"rationale\": \"Consumer hardware review, no delivery angle.\"}]}",
+          "type": "output_text"
+        }
+      ],
+      "role": "assistant",
+      "status": "completed",
+      "type": "message"
+    }
+  ],
+  "parallel_tool_calls": false,
+  "tool_choice": "auto",
+  "tools": [],
+  "status": "completed",
+  "usage": {
+    "input_tokens": 1901,
+    "input_tokens_details": {
+      "cache_write_tokens": 0,
+      "cached_tokens": 0
+    },
+    "output_tokens": 140,
+    "output_tokens_details": {
+      "reasoning_tokens": 44
+    },
+    "total_tokens": 2041
+  }
+}

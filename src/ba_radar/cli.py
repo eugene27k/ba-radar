@@ -17,9 +17,10 @@ from typing import Annotated
 import typer
 
 from ba_radar import tasks
+from ba_radar.llm import COLLECT_TASKS, ProviderConfigError, ProviderPool
 from ba_radar.registry import load_registry
 from ba_radar.schedule import evaluate_gate
-from ba_radar.settings import Secrets, Settings
+from ba_radar.settings import LLMSecrets, Secrets, Settings
 
 app = typer.Typer(
     add_completion=False,
@@ -42,14 +43,31 @@ def _echo_log(entries: list[object]) -> None:
         source = getattr(entry, "source_id", None)
         message = getattr(entry, "message", str(entry))
         prefix = f"[{level}]" + (f" {source}" if source else "")
-        colour = typer.colors.RED if level == "error" else typer.colors.YELLOW
+        colour = {
+            "error": typer.colors.RED,
+            "warning": typer.colors.YELLOW,
+        }.get(level, typer.colors.GREEN)
         typer.secho(f"  {prefix}: {message}", fg=colour)
+
+
+def _require_provider(cfg: Settings) -> None:
+    """Fail before touching any state when the configured provider has no key.
+
+    Items collected without a provider could never be scored — their excerpts are
+    gone once the run ends — so a misconfigured run must collect nothing.
+    """
+    try:
+        ProviderPool.for_tasks(cfg.llm, LLMSecrets.from_env(), COLLECT_TASKS)
+    except ProviderConfigError as exc:
+        typer.secho(str(exc), fg=typer.colors.RED, err=True)
+        raise typer.Exit(2) from exc
 
 
 @app.command()
 def collect(settings: SettingsOption = None) -> None:
-    """Fetch every active source, normalise, dedupe and store."""
+    """Fetch every active source, normalise, dedupe, score, analyse and store."""
     cfg = _load(settings)
+    _require_provider(cfg)
     summary = asyncio.run(tasks.collect(cfg))
 
     typer.echo(
@@ -74,7 +92,7 @@ def prepare_digest_cmd(settings: SettingsOption = None) -> None:
         case _:
             typer.echo(
                 f"run #{summary.run_id} prepared: {summary.selected} of "
-                f"{summary.pool} undelivered item(s)"
+                f"{summary.pool} undelivered item(s); {summary.processed} processed"
             )
 
 
@@ -136,6 +154,9 @@ def run(
         except RuntimeError as exc:
             typer.secho(f"{exc} — set them or use --dry-run", fg=typer.colors.RED, err=True)
             raise typer.Exit(2) from exc
+    # Both modes score during collect, so both need the model provider's key. Note
+    # that --dry-run therefore spends a few cents per run since Stage 2.
+    _require_provider(cfg)
 
     summary = asyncio.run(tasks.collect(cfg))
     typer.echo(
@@ -233,6 +254,57 @@ def status(settings: SettingsOption = None, limit: int = 10) -> None:
             f"collected={entry.collected_count} delivered={entry.delivered_count} "
             f"errors={len(entry.errors)}"
         )
+        for info in entry.infos:
+            typer.secho(f"      {info.message}", fg=typer.colors.GREEN)
+
+
+@app.command("llm-check")
+def llm_check(
+    settings: SettingsOption = None,
+    task: Annotated[
+        str, typer.Option("--task", help="Which task's provider/model to exercise.")
+    ] = "relevance",
+) -> None:
+    """Make one tiny call through the configured provider to verify the key and model."""
+    from pydantic import BaseModel
+
+    from ba_radar.llm import LLMRequest, ProviderError, estimate_cost
+
+    cfg = _load(settings)
+
+    class Ping(BaseModel):
+        ok: bool
+        echo: str
+
+    try:
+        pool = ProviderPool.for_tasks(cfg.llm, LLMSecrets.from_env(), (task,))
+        provider, route = pool.for_task(task)
+    except ProviderConfigError as exc:
+        typer.secho(str(exc), fg=typer.colors.RED, err=True)
+        raise typer.Exit(2) from exc
+
+    request = LLMRequest(
+        task=task,
+        model=route.model,
+        system="You are a connectivity check. Reply with JSON only.",
+        user='Set "ok" to true and "echo" to the word "radar".',
+        output_model=Ping,
+        max_tokens=min(route.max_tokens, 2000),
+        effort=route.effort,
+    )
+    try:
+        response = asyncio.run(provider.complete(request))
+    except ProviderError as exc:
+        typer.secho(f"provider call failed: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(1) from exc
+
+    cost = estimate_cost(cfg.llm, response.model, response.input_tokens, response.output_tokens)
+    typer.echo(
+        f"provider={response.provider} model={response.model} task={task} "
+        f"ok={response.parsed.ok} echo={response.parsed.echo!r} "
+        f"tokens_in={response.input_tokens} tokens_out={response.output_tokens} "
+        f"est_cost={'$' + format(cost, '.5f') if cost is not None else 'n/a'}"
+    )
 
 
 @app.command("prune")
