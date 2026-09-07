@@ -47,4 +47,10 @@ INDICATOR_UK: dict[Indicator, str] = {
     Indicator.MIXED: "Змішаний",
 }
 
+# Digest chrome (PRD 3.1.3–3.1.5).
+PROCESSED_UK = "Опрацьовано матеріалів"
+CONTINUATION_UK = "продовження"
+UNSCORED_BLOCK_UK = "Без аналізу"
+INSIGHT_PREFIX_UK = "BA:"
+
 NO_NEW_ITEMS = "Нових релевантних матеріалів за добу немає"
